@@ -115,6 +115,14 @@ class KernelBuilder:
         zero_const = self.preload_const(0)
         one_const = self.preload_const(1)
 
+        # Multiplier constants for multiply_add optimization
+        # Stage 0: (a + const) + (a << 12) = a * (1 + 2^12) + const = a * 4097 + const
+        # Stage 2: (a + const) + (a << 5) = a * (1 + 2^5) + const = a * 33 + const
+        # Stage 4: (a + const) + (a << 3) = a * (1 + 2^3) + const = a * 9 + const
+        mult_4097 = self.preload_const(4097)
+        mult_33 = self.preload_const(33)
+        mult_9 = self.preload_const(9)
+
         # Memory layout
         init_vars = ["rounds", "n_nodes", "batch_size", "forest_height",
                     "forest_values_p", "inp_indices_p", "inp_values_p"]
@@ -161,6 +169,11 @@ class KernelBuilder:
             vc2 = self.alloc_scratch(f"vhc2_{i}", VLEN)
             v_hash_consts.append((vc1, vc2))
 
+        # Vector multiplier constants for multiply_add optimization
+        v_mult_4097 = self.alloc_scratch("v_mult_4097", VLEN)
+        v_mult_33 = self.alloc_scratch("v_mult_33", VLEN)
+        v_mult_9 = self.alloc_scratch("v_mult_9", VLEN)
+
         # ===== INIT PHASE =====
         tmp_addr = self.alloc_scratch("tmp_addr")
         for i, v in enumerate(init_vars):
@@ -175,6 +188,13 @@ class KernelBuilder:
             ("vbroadcast", v_one, one_const),
             ("vbroadcast", v_zero, zero_const),
             ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]),
+        ]})
+
+        # Broadcast multiplier constants
+        self.add_bundle({"valu": [
+            ("vbroadcast", v_mult_4097, mult_4097),
+            ("vbroadcast", v_mult_33, mult_33),
+            ("vbroadcast", v_mult_9, mult_9),
         ]})
 
         for i in range(0, len(hash_consts), 3):
@@ -238,19 +258,31 @@ class KernelBuilder:
                 ]})
 
                 # Hash stages 0-5 for all 3 batches
+                # Stages 0, 2, 4: use multiply_add (saves 1 cycle each)
+                # Stages 1, 3, 5: use original 2-cycle approach
+                mult_consts = [v_mult_4097, None, v_mult_33, None, v_mult_9, None]
                 for hi in range(6):
                     vc1, vc2 = v_hash_consts[hi]
                     op1, _, op2, op3, _ = HASH_STAGES[hi]
-                    self.add_bundle({"valu": [
-                        (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
-                        (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
-                        (op1, v_tmp1_E, val_C, vc1), (op3, v_tmp2_E, val_C, vc2),
-                    ]})
-                    self.add_bundle({"valu": [
-                        (op2, val_A, v_tmp1_A, v_tmp2_A),
-                        (op2, val_B, v_tmp1_B, v_tmp2_B),
-                        (op2, val_C, v_tmp1_E, v_tmp2_E),
-                    ]})
+                    if hi in [0, 2, 4]:
+                        # multiply_add: val = val * mult + const
+                        self.add_bundle({"valu": [
+                            ("multiply_add", val_A, val_A, mult_consts[hi], vc1),
+                            ("multiply_add", val_B, val_B, mult_consts[hi], vc1),
+                            ("multiply_add", val_C, val_C, mult_consts[hi], vc1),
+                        ]})
+                    else:
+                        # Original 2-cycle approach
+                        self.add_bundle({"valu": [
+                            (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
+                            (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
+                            (op1, v_tmp1_E, val_C, vc1), (op3, v_tmp2_E, val_C, vc2),
+                        ]})
+                        self.add_bundle({"valu": [
+                            (op2, val_A, v_tmp1_A, v_tmp2_A),
+                            (op2, val_B, v_tmp1_B, v_tmp2_B),
+                            (op2, val_C, v_tmp1_E, v_tmp2_E),
+                        ]})
 
                 # idx = (val & 1) + 1
                 self.add_bundle({"valu": [
@@ -267,14 +299,21 @@ class KernelBuilder:
 
                 self.add_bundle({"valu": [("^", val_A, val_A, v_node_shared), ("^", val_B, val_B, v_node_shared)]})
 
+                mult_consts = [v_mult_4097, None, v_mult_33, None, v_mult_9, None]
                 for hi in range(6):
                     vc1, vc2 = v_hash_consts[hi]
                     op1, _, op2, op3, _ = HASH_STAGES[hi]
-                    self.add_bundle({"valu": [
-                        (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
-                        (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
-                    ]})
-                    self.add_bundle({"valu": [(op2, val_A, v_tmp1_A, v_tmp2_A), (op2, val_B, v_tmp1_B, v_tmp2_B)]})
+                    if hi in [0, 2, 4]:
+                        self.add_bundle({"valu": [
+                            ("multiply_add", val_A, val_A, mult_consts[hi], vc1),
+                            ("multiply_add", val_B, val_B, mult_consts[hi], vc1),
+                        ]})
+                    else:
+                        self.add_bundle({"valu": [
+                            (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
+                            (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
+                        ]})
+                        self.add_bundle({"valu": [(op2, val_A, v_tmp1_A, v_tmp2_A), (op2, val_B, v_tmp1_B, v_tmp2_B)]})
 
                 self.add_bundle({"valu": [("&", idx_A, val_A, v_one), ("&", idx_B, val_B, v_one)]})
                 self.add_bundle({"valu": [("+", idx_A, idx_A, v_one), ("+", idx_B, idx_B, v_one)]})
@@ -1289,19 +1328,28 @@ class KernelBuilder:
                     ("^", val_C, val_C, v_node_shared),
                 ]})
 
+                # Hash stages 0-5 with multiply_add for stages 0, 2, 4
+                mult_consts = [v_mult_4097, None, v_mult_33, None, v_mult_9, None]
                 for hi in range(6):
                     vc1, vc2 = v_hash_consts[hi]
                     op1, _, op2, op3, _ = HASH_STAGES[hi]
-                    self.add_bundle({"valu": [
-                        (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
-                        (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
-                        (op1, v_tmp1_E, val_C, vc1), (op3, v_tmp2_E, val_C, vc2),
-                    ]})
-                    self.add_bundle({"valu": [
-                        (op2, val_A, v_tmp1_A, v_tmp2_A),
-                        (op2, val_B, v_tmp1_B, v_tmp2_B),
-                        (op2, val_C, v_tmp1_E, v_tmp2_E),
-                    ]})
+                    if hi in [0, 2, 4]:
+                        self.add_bundle({"valu": [
+                            ("multiply_add", val_A, val_A, mult_consts[hi], vc1),
+                            ("multiply_add", val_B, val_B, mult_consts[hi], vc1),
+                            ("multiply_add", val_C, val_C, mult_consts[hi], vc1),
+                        ]})
+                    else:
+                        self.add_bundle({"valu": [
+                            (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
+                            (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
+                            (op1, v_tmp1_E, val_C, vc1), (op3, v_tmp2_E, val_C, vc2),
+                        ]})
+                        self.add_bundle({"valu": [
+                            (op2, val_A, v_tmp1_A, v_tmp2_A),
+                            (op2, val_B, v_tmp1_B, v_tmp2_B),
+                            (op2, val_C, v_tmp1_E, v_tmp2_E),
+                        ]})
 
                 self.add_bundle({"valu": [
                     ("&", idx_A, val_A, v_one), ("&", idx_B, val_B, v_one), ("&", idx_C, val_C, v_one),
@@ -1314,14 +1362,21 @@ class KernelBuilder:
                 val_A, val_B = v_val[b], v_val[b + 1]
                 idx_A, idx_B = v_idx[b], v_idx[b + 1]
                 self.add_bundle({"valu": [("^", val_A, val_A, v_node_shared), ("^", val_B, val_B, v_node_shared)]})
+                mult_consts = [v_mult_4097, None, v_mult_33, None, v_mult_9, None]
                 for hi in range(6):
                     vc1, vc2 = v_hash_consts[hi]
                     op1, _, op2, op3, _ = HASH_STAGES[hi]
-                    self.add_bundle({"valu": [
-                        (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
-                        (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
-                    ]})
-                    self.add_bundle({"valu": [(op2, val_A, v_tmp1_A, v_tmp2_A), (op2, val_B, v_tmp1_B, v_tmp2_B)]})
+                    if hi in [0, 2, 4]:
+                        self.add_bundle({"valu": [
+                            ("multiply_add", val_A, val_A, mult_consts[hi], vc1),
+                            ("multiply_add", val_B, val_B, mult_consts[hi], vc1),
+                        ]})
+                    else:
+                        self.add_bundle({"valu": [
+                            (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
+                            (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
+                        ]})
+                        self.add_bundle({"valu": [(op2, val_A, v_tmp1_A, v_tmp2_A), (op2, val_B, v_tmp1_B, v_tmp2_B)]})
                 self.add_bundle({"valu": [("&", idx_A, val_A, v_one), ("&", idx_B, val_B, v_one)]})
                 self.add_bundle({"valu": [("+", idx_A, idx_A, v_one), ("+", idx_B, idx_B, v_one)]})
 
@@ -1339,15 +1394,22 @@ class KernelBuilder:
             self.add_bundle({"flow": [("vselect", v_node_A, v_tmp1_A, v_node1, v_node2)]})
             self.add_bundle({"flow": [("vselect", v_node_B, v_tmp1_B, v_node1, v_node2)]})
             self.add_bundle({"valu": [("^", val_A, val_A, v_node_A), ("^", val_B, val_B, v_node_B)]})
-            # Hash
+            # Hash with multiply_add for stages 0, 2, 4
+            mult_consts = [v_mult_4097, None, v_mult_33, None, v_mult_9, None]
             for hi in range(6):
                 vc1, vc2 = v_hash_consts[hi]
                 op1, _, op2, op3, _ = HASH_STAGES[hi]
-                self.add_bundle({"valu": [
-                    (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
-                    (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
-                ]})
-                self.add_bundle({"valu": [(op2, val_A, v_tmp1_A, v_tmp2_A), (op2, val_B, v_tmp1_B, v_tmp2_B)]})
+                if hi in [0, 2, 4]:
+                    self.add_bundle({"valu": [
+                        ("multiply_add", val_A, val_A, mult_consts[hi], vc1),
+                        ("multiply_add", val_B, val_B, mult_consts[hi], vc1),
+                    ]})
+                else:
+                    self.add_bundle({"valu": [
+                        (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
+                        (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
+                    ]})
+                    self.add_bundle({"valu": [(op2, val_A, v_tmp1_A, v_tmp2_A), (op2, val_B, v_tmp1_B, v_tmp2_B)]})
             # idx = 2*idx + (val%2 + 1)
             self.add_bundle({"valu": [("&", v_tmp1_A, val_A, v_one), ("<<", idx_A, idx_A, v_one)]})
             self.add_bundle({"valu": [("&", v_tmp1_B, val_B, v_one), ("<<", idx_B, idx_B, v_one)]})
