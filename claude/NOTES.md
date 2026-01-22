@@ -1,10 +1,10 @@
 # Optimization Notes - Persistent Memory
 
 ## Current State
-- **Cycles**: 3633 (down from 3845 at previous session start)
+- **Cycles**: 3628 (down from 3845 at session start, 3633 after previous session)
 - **Target**: ~1300 cycles (best known: 1363)
-- **Gap**: Need ~2.7x reduction
-- **Progress this session**: 3845 → 3633 (212 cycles, 5.5% improvement)
+- **Gap**: Need ~2.8x reduction
+- **Progress this session**: 3633 → 3628 (5 cycles from Round 14-15 pipelining)
 
 ## Architecture Constraints (Critical)
 ```
@@ -103,6 +103,52 @@ python tests/submission_tests.py
 python perf_takehome.py Tests.test_kernel_cycles
 ```
 
+## Detailed Bundle Analysis (at 3628 cycles)
+
+### Bundle Composition
+| Type | Count | % of Total |
+|------|-------|-----------|
+| Load+VALU | 489 | 20.4% |
+| Load-only | 86 | 3.6% |
+| VALU-only | 1597 | **66.6%** |
+| Neither | 226 | 9.4% |
+| **Total** | 2398 | 100% |
+
+### VALU Ops Distribution
+| VALU ops/bundle | Count | % |
+|-----------------|-------|---|
+| 0 | 312 | 13.0% |
+| 1 | 159 | 6.6% |
+| 2 | 697 | 29.1% |
+| 3 | 329 | 13.7% |
+| 4 | 757 | 31.6% |
+| 5 | 82 | 3.4% |
+| 6 (max) | 62 | 2.6% |
+
+### Resource Utilization
+- **VALU utilization**: 44.1% (6350 ops / 14388 capacity)
+- **Load utilization**: Poor - 1597 VALU-only bundles waste 3194 load slots
+- **Flow utilization**: 302 ops across all bundles
+
+### Bottleneck Analysis
+- Total VALU ops: 6350 (needs 1058 cycles at 6/cycle)
+- Total load ops: 1130 (needs 565 cycles at 2/cycle)
+- Total flow ops: 302 (needs 302 cycles at 1/cycle)
+- **Theoretical minimum**: max(1058, 565, 302) ≈ **1058 cycles**
+- **Current**: 3628 cycles = **3.4x theoretical**
+
+### Why 1363 Cycles is Achievable
+Best known solution (1363 cycles) achieves near-theoretical VALU packing:
+- 1363 × 6 = 8178 VALU capacity, needs 6350 ops = 78% utilization
+- Must have near-perfect load+VALU overlap
+- Minimal VALU-only bundles
+
+### Key Insight
+The 1597 VALU-only bundles (67% of code!) are the primary waste. These represent cycles where:
+- Load slots are empty (could be doing useful loads)
+- VALU capacity is partially utilized
+- The structural bottleneck is group-by-group processing with VALU-only tails
+
 ## Session History
 - Session 1: Baseline optimizations, reached ~4300 cycles
 - Session 2: multiply_add, forest reuse, round overlap → 3845 cycles
@@ -113,3 +159,7 @@ python perf_takehome.py Tests.test_kernel_cycles
   - Group 7 now pre-loads next round's Group 0 nodes during hash computation
   - Applied same optimization to Round 10's Group 0 (-20 cycles)
   - Total improvement: 212 cycles (5.5% reduction)
+- Session 4 (current): Round 14-15 pipelining, detailed analysis
+  - Round 14 Group 7 pre-loads Round 15 Group 0 batch 0 (-5 cycles)
+  - Identified 67% VALU-only bundles as main waste
+  - Theoretical minimum is ~1058 cycles based on VALU ops
