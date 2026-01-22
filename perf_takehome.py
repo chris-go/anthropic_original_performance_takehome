@@ -338,21 +338,12 @@ class KernelBuilder:
                 ("==", v_tmp1_F, idx_A, v_one), ("==", v_tmp2_F, idx_B, v_one),
                 ("+", prev_idx_A, prev_idx_A, prev_tmp1_A), ("+", prev_idx_B, prev_idx_B, prev_tmp1_B),
             ]})
-            # vselect A + bounds compare for previous
-            self.add_bundle({
-                "flow": [("vselect", v_node_A, v_tmp1_F, v_node1, v_node2)],
-                "valu": [("<", prev_tmp1_A, prev_idx_A, v_n_nodes), ("<", prev_tmp1_B, prev_idx_B, v_n_nodes)],
-            })
-            # vselect B + bounds vselect A for previous
-            self.add_bundle({
-                "flow": [("vselect", v_node_B, v_tmp2_F, v_node1, v_node2)],
-            })
-            # XOR + bounds vselect B for previous (need separate cycle for vselect)
-            self.add_bundle({"flow": [("vselect", prev_idx_A, prev_tmp1_A, prev_idx_A, v_zero)]})
-            self.add_bundle({
-                "flow": [("vselect", prev_idx_B, prev_tmp1_B, prev_idx_B, v_zero)],
-                "valu": [("^", val_A, val_A, v_node_A), ("^", val_B, val_B, v_node_B)],
-            })
+            # vselect A for current (no bounds check needed - idx always < n_nodes)
+            self.add_bundle({"flow": [("vselect", v_node_A, v_tmp1_F, v_node1, v_node2)]})
+            # vselect B for current
+            self.add_bundle({"flow": [("vselect", v_node_B, v_tmp2_F, v_node1, v_node2)]})
+            # XOR for current
+            self.add_bundle({"valu": [("^", val_A, val_A, v_node_A), ("^", val_B, val_B, v_node_B)]})
 
             # Hash stages
             for hi in range(6):
@@ -373,11 +364,8 @@ class KernelBuilder:
             prev_idx_A, prev_idx_B = idx_A, idx_B
             prev_tmp1_A, prev_tmp1_B = v_tmp1_A, v_tmp1_B
 
-        # Finish last pair's idx (no overlap)
+        # Finish last pair's idx (no bounds check needed - idx always < n_nodes)
         self.add_bundle({"valu": [("+", prev_idx_A, prev_idx_A, prev_tmp1_A), ("+", prev_idx_B, prev_idx_B, prev_tmp1_B)]})
-        self.add_bundle({"valu": [("<", prev_tmp1_A, prev_idx_A, v_n_nodes), ("<", prev_tmp1_B, prev_idx_B, v_n_nodes)]})
-        self.add_bundle({"flow": [("vselect", prev_idx_A, prev_tmp1_A, prev_idx_A, v_zero)]})
-        self.add_bundle({"flow": [("vselect", prev_idx_B, prev_tmp1_B, prev_idx_B, v_zero)]})
 
         # ===== ROUND 2 SPECIAL CASE =====
         # Indices are in {3,4,5,6}, so only 4 forest values needed
