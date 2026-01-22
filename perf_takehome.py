@@ -114,6 +114,7 @@ class KernelBuilder:
 
         zero_const = self.preload_const(0)
         one_const = self.preload_const(1)
+        two_const = self.preload_const(2)
 
         # Multiplier constants for multiply_add optimization
         # Stage 0: (a + const) + (a << 12) = a * (1 + 2^12) + const = a * 4097 + const
@@ -149,6 +150,7 @@ class KernelBuilder:
         v_tmp2_C = self.alloc_scratch("v_tmp2_C", VLEN)
 
         v_one = self.alloc_scratch("v_one", VLEN)
+        v_two = self.alloc_scratch("v_two", VLEN)
         v_zero = self.alloc_scratch("v_zero", VLEN)
         v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
 
@@ -186,6 +188,7 @@ class KernelBuilder:
 
         self.add_bundle({"valu": [
             ("vbroadcast", v_one, one_const),
+            ("vbroadcast", v_two, two_const),
             ("vbroadcast", v_zero, zero_const),
             ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]),
         ]})
@@ -1439,10 +1442,12 @@ class KernelBuilder:
                         (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
                     ]})
                     self.add_bundle({"valu": [(op2, val_A, v_tmp1_A, v_tmp2_A), (op2, val_B, v_tmp1_B, v_tmp2_B)]})
-            # idx = 2*idx + (val%2 + 1)
-            self.add_bundle({"valu": [("&", v_tmp1_A, val_A, v_one), ("<<", idx_A, idx_A, v_one)]})
-            self.add_bundle({"valu": [("&", v_tmp1_B, val_B, v_one), ("<<", idx_B, idx_B, v_one)]})
-            self.add_bundle({"valu": [("+", v_tmp1_A, v_tmp1_A, v_one), ("+", v_tmp1_B, v_tmp1_B, v_one)]})
+            # idx = 2*idx + 1 + (val&1) using multiply_add
+            self.add_bundle({"valu": [("&", v_tmp1_A, val_A, v_one), ("&", v_tmp1_B, val_B, v_one)]})
+            self.add_bundle({"valu": [
+                ("multiply_add", idx_A, idx_A, v_two, v_one),
+                ("multiply_add", idx_B, idx_B, v_two, v_one),
+            ]})
             self.add_bundle({"valu": [("+", idx_A, idx_A, v_tmp1_A), ("+", idx_B, idx_B, v_tmp1_B)]})
             # No bounds check needed - indices will be {3,4,5,6} < n_nodes
 
