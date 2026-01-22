@@ -1073,6 +1073,7 @@ class KernelBuilder:
             self.add_bundle({"valu": [("+", batch_info[3][0], batch_info[3][0], tmp_list[3][0])]})
 
         # ===== GROUP 7: Use pre-loaded nodes, no next group to load =====
+        # OPTIMIZED: Use multiply_add for hash stages 0, 2, 4
         base = 7 * 4
         batch_info = [(v_idx[base + i], v_val[base + i]) for i in range(4)]
         nodes = node_set_B  # Group 7 (odd) uses set B
@@ -1084,16 +1085,16 @@ class KernelBuilder:
             ("^", batch_info[2][1], batch_info[2][1], nodes[2]),
             ("^", batch_info[3][1], batch_info[3][1], nodes[3]),
         ]})
-        # Hash all 4 batches - stage 0
+
+        # Hash stage 0 with multiply_add (all 4 batches in 1 cycle)
         self.add_bundle({"valu": [
-            (op1_0, tmp_list[0][0], batch_info[0][1], vc1_0), (op3_0, tmp_list[0][1], batch_info[0][1], vc2_0),
-            (op1_0, tmp_list[1][0], batch_info[1][1], vc1_0), (op3_0, tmp_list[1][1], batch_info[1][1], vc2_0),
+            ("multiply_add", batch_info[0][1], batch_info[0][1], v_mult_4097, vc1_0),
+            ("multiply_add", batch_info[1][1], batch_info[1][1], v_mult_4097, vc1_0),
+            ("multiply_add", batch_info[2][1], batch_info[2][1], v_mult_4097, vc1_0),
+            ("multiply_add", batch_info[3][1], batch_info[3][1], v_mult_4097, vc1_0),
         ]})
-        self.add_bundle({"valu": [
-            (op2_0, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
-            (op2_0, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
-            (op1_0, tmp_list[2][0], batch_info[2][1], vc1_0), (op3_0, tmp_list[2][1], batch_info[2][1], vc2_0),
-        ]})
+
+        # Hash stage 1 (can't use multiply_add - XOR pattern)
         self.add_bundle({"valu": [
             (op1_1, tmp_list[0][0], batch_info[0][1], vc1_1), (op3_1, tmp_list[0][1], batch_info[0][1], vc2_1),
             (op1_1, tmp_list[1][0], batch_info[1][1], vc1_1), (op3_1, tmp_list[1][1], batch_info[1][1], vc2_1),
@@ -1101,18 +1102,25 @@ class KernelBuilder:
         self.add_bundle({"valu": [
             (op2_1, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
             (op2_1, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
-            (op2_0, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
-            (op1_0, tmp_list[3][0], batch_info[3][1], vc1_0), (op3_0, tmp_list[3][1], batch_info[3][1], vc2_0),
-        ]})
-        self.add_bundle({"valu": [
-            (op1_2, tmp_list[0][0], batch_info[0][1], vc1_2), (op3_2, tmp_list[0][1], batch_info[0][1], vc2_2),
-            (op1_2, tmp_list[1][0], batch_info[1][1], vc1_2), (op3_2, tmp_list[1][1], batch_info[1][1], vc2_2),
-        ]})
-        self.add_bundle({"valu": [
-            (op2_2, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
-            (op2_2, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
             (op1_1, tmp_list[2][0], batch_info[2][1], vc1_1), (op3_1, tmp_list[2][1], batch_info[2][1], vc2_1),
         ]})
+        self.add_bundle({"valu": [
+            (op2_1, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
+            (op1_1, tmp_list[3][0], batch_info[3][1], vc1_1), (op3_1, tmp_list[3][1], batch_info[3][1], vc2_1),
+        ]})
+        self.add_bundle({"valu": [
+            (op2_1, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
+        ]})
+
+        # Hash stage 2 with multiply_add (all 4 batches in 1 cycle)
+        self.add_bundle({"valu": [
+            ("multiply_add", batch_info[0][1], batch_info[0][1], v_mult_33, vc1_2),
+            ("multiply_add", batch_info[1][1], batch_info[1][1], v_mult_33, vc1_2),
+            ("multiply_add", batch_info[2][1], batch_info[2][1], v_mult_33, vc1_2),
+            ("multiply_add", batch_info[3][1], batch_info[3][1], v_mult_33, vc1_2),
+        ]})
+
+        # Hash stage 3 (can't use multiply_add - XOR with shifted value)
         self.add_bundle({"valu": [
             (op1_3, tmp_list[0][0], batch_info[0][1], vc1_3), (op3_3, tmp_list[0][1], batch_info[0][1], vc2_3),
             (op1_3, tmp_list[1][0], batch_info[1][1], vc1_3), (op3_3, tmp_list[1][1], batch_info[1][1], vc2_3),
@@ -1120,18 +1128,25 @@ class KernelBuilder:
         self.add_bundle({"valu": [
             (op2_3, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
             (op2_3, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
-            (op2_1, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
-            (op2_0, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
+            (op1_3, tmp_list[2][0], batch_info[2][1], vc1_3), (op3_3, tmp_list[2][1], batch_info[2][1], vc2_3),
         ]})
         self.add_bundle({"valu": [
-            (op1_4, tmp_list[0][0], batch_info[0][1], vc1_4), (op3_4, tmp_list[0][1], batch_info[0][1], vc2_4),
-            (op1_4, tmp_list[1][0], batch_info[1][1], vc1_4), (op3_4, tmp_list[1][1], batch_info[1][1], vc2_4),
+            (op2_3, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
+            (op1_3, tmp_list[3][0], batch_info[3][1], vc1_3), (op3_3, tmp_list[3][1], batch_info[3][1], vc2_3),
         ]})
         self.add_bundle({"valu": [
-            (op2_4, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
-            (op2_4, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
-            (op1_2, tmp_list[2][0], batch_info[2][1], vc1_2), (op3_2, tmp_list[2][1], batch_info[2][1], vc2_2),
+            (op2_3, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
         ]})
+
+        # Hash stage 4 with multiply_add (all 4 batches in 1 cycle)
+        self.add_bundle({"valu": [
+            ("multiply_add", batch_info[0][1], batch_info[0][1], v_mult_9, vc1_4),
+            ("multiply_add", batch_info[1][1], batch_info[1][1], v_mult_9, vc1_4),
+            ("multiply_add", batch_info[2][1], batch_info[2][1], v_mult_9, vc1_4),
+            ("multiply_add", batch_info[3][1], batch_info[3][1], v_mult_9, vc1_4),
+        ]})
+
+        # Hash stage 5 (can't use multiply_add - XOR pattern)
         self.add_bundle({"valu": [
             (op1_5, tmp_list[0][0], batch_info[0][1], vc1_5), (op3_5, tmp_list[0][1], batch_info[0][1], vc2_5),
             (op1_5, tmp_list[1][0], batch_info[1][1], vc1_5), (op3_5, tmp_list[1][1], batch_info[1][1], vc2_5),
@@ -1139,57 +1154,36 @@ class KernelBuilder:
         self.add_bundle({"valu": [
             (op2_5, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
             (op2_5, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
-            (op2_2, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
-            (op1_1, tmp_list[3][0], batch_info[3][1], vc1_1), (op3_1, tmp_list[3][1], batch_info[3][1], vc2_1),
-        ]})
-        # Finish hash for batches 2,3 and compute idx for all
-        self.add_bundle({"valu": [
-            ("&", tmp_list[0][0], batch_info[0][1], v_one), ("<<", batch_info[0][0], batch_info[0][0], v_one),
-            ("&", tmp_list[1][0], batch_info[1][1], v_one), ("<<", batch_info[1][0], batch_info[1][0], v_one),
+            (op1_5, tmp_list[2][0], batch_info[2][1], vc1_5), (op3_5, tmp_list[2][1], batch_info[2][1], vc2_5),
         ]})
         self.add_bundle({"valu": [
-            ("+", tmp_list[0][0], tmp_list[0][0], v_one),
-            ("+", tmp_list[1][0], tmp_list[1][0], v_one),
-            (op1_3, tmp_list[2][0], batch_info[2][1], vc1_3), (op3_3, tmp_list[2][1], batch_info[2][1], vc2_3),
+            (op2_5, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
+            (op1_5, tmp_list[3][0], batch_info[3][1], vc1_5), (op3_5, tmp_list[3][1], batch_info[3][1], vc2_5),
+        ]})
+        self.add_bundle({"valu": [
+            (op2_5, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
+        ]})
+
+        # Compute idx for all 4 batches: idx = 2*idx + 1 + (val&1)
+        # Use multiply_add: idx = 2*idx + 1, then idx += (val&1)
+        self.add_bundle({"valu": [
+            ("multiply_add", batch_info[0][0], batch_info[0][0], v_two, v_one),
+            ("multiply_add", batch_info[1][0], batch_info[1][0], v_two, v_one),
+            ("multiply_add", batch_info[2][0], batch_info[2][0], v_two, v_one),
+            ("multiply_add", batch_info[3][0], batch_info[3][0], v_two, v_one),
+        ]})
+        self.add_bundle({"valu": [
+            ("&", tmp_list[0][0], batch_info[0][1], v_one),
+            ("&", tmp_list[1][0], batch_info[1][1], v_one),
+            ("&", tmp_list[2][0], batch_info[2][1], v_one),
+            ("&", tmp_list[3][0], batch_info[3][1], v_one),
         ]})
         self.add_bundle({"valu": [
             ("+", batch_info[0][0], batch_info[0][0], tmp_list[0][0]),
             ("+", batch_info[1][0], batch_info[1][0], tmp_list[1][0]),
-            (op2_3, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
-            (op2_1, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
-        ]})
-        self.add_bundle({"valu": [
-            (op1_4, tmp_list[2][0], batch_info[2][1], vc1_4), (op3_4, tmp_list[2][1], batch_info[2][1], vc2_4),
-            (op1_2, tmp_list[3][0], batch_info[3][1], vc1_2), (op3_2, tmp_list[3][1], batch_info[3][1], vc2_2),
-        ]})
-        self.add_bundle({"valu": [
-            (op2_4, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
-            (op2_2, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
-        ]})
-        self.add_bundle({"valu": [
-            (op1_5, tmp_list[2][0], batch_info[2][1], vc1_5), (op3_5, tmp_list[2][1], batch_info[2][1], vc2_5),
-            (op1_3, tmp_list[3][0], batch_info[3][1], vc1_3), (op3_3, tmp_list[3][1], batch_info[3][1], vc2_3),
-        ]})
-        self.add_bundle({"valu": [
-            (op2_5, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
-            (op2_3, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
-        ]})
-        self.add_bundle({"valu": [
-            ("&", tmp_list[2][0], batch_info[2][1], v_one), ("<<", batch_info[2][0], batch_info[2][0], v_one),
-            (op1_4, tmp_list[3][0], batch_info[3][1], vc1_4), (op3_4, tmp_list[3][1], batch_info[3][1], vc2_4),
-        ]})
-        self.add_bundle({"valu": [
-            ("+", tmp_list[2][0], tmp_list[2][0], v_one),
-            (op2_4, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
-        ]})
-        self.add_bundle({"valu": [
             ("+", batch_info[2][0], batch_info[2][0], tmp_list[2][0]),
-            (op1_5, tmp_list[3][0], batch_info[3][1], vc1_5), (op3_5, tmp_list[3][1], batch_info[3][1], vc2_5),
+            ("+", batch_info[3][0], batch_info[3][0], tmp_list[3][0]),
         ]})
-        self.add_bundle({"valu": [(op2_5, batch_info[3][1], tmp_list[3][0], tmp_list[3][1])]})
-        self.add_bundle({"valu": [("&", tmp_list[3][0], batch_info[3][1], v_one), ("<<", batch_info[3][0], batch_info[3][0], v_one)]})
-        self.add_bundle({"valu": [("+", tmp_list[3][0], tmp_list[3][0], v_one)]})
-        self.add_bundle({"valu": [("+", batch_info[3][0], batch_info[3][0], tmp_list[3][0])]})
 
         # Round loop control - loop for rounds 3-9 only (7 iterations, no bounds check)
         self.add_bundle({"flow": [("add_imm", round_counter, round_counter, 1)]})
