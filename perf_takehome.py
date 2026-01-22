@@ -1346,8 +1346,7 @@ class KernelBuilder:
         # After round 10, ALL indices wrap to 0!
 
         # Round 11 (like round 0): all indices are 0 - process 3 batches at a time
-        self.add_bundle({"load": [("load", node_scalar, self.scratch["forest_values_p"])]})
-        self.add_bundle({"valu": [("vbroadcast", v_node_shared, node_scalar)]})
+        # OPTIMIZATION: Reuse v_node_shared from round 0 (forest[0] doesn't change)
 
         for group in range(11):
             if group < 10:
@@ -1413,10 +1412,7 @@ class KernelBuilder:
                 self.add_bundle({"valu": [("+", idx_A, idx_A, v_one), ("+", idx_B, idx_B, v_one)]})
 
         # Round 12 (like round 1): indices in {1,2}
-        self.add_bundle({"flow": [("add_imm", addr1, self.scratch["forest_values_p"], 1)]})
-        self.add_bundle({"flow": [("add_imm", addr2, self.scratch["forest_values_p"], 2)]})
-        self.add_bundle({"load": [("load", node1_scalar, addr1), ("load", node2_scalar, addr2)]})
-        self.add_bundle({"valu": [("vbroadcast", v_node1, node1_scalar), ("vbroadcast", v_node2, node2_scalar)]})
+        # OPTIMIZATION: Reuse v_node1, v_node2 from round 1 (forest[1,2] don't change)
 
         for b in range(0, num_batches, 2):
             val_A, val_B = v_val[b], v_val[b + 1]
@@ -1452,17 +1448,7 @@ class KernelBuilder:
             # No bounds check needed - indices will be {3,4,5,6} < n_nodes
 
         # Round 13 (like round 2): indices in {3,4,5,6}
-        # Reload forest[3..6] and use vselect tree - PIPELINED
-        self.add_bundle({"flow": [("add_imm", addr3, self.scratch["forest_values_p"], 3)]})
-        self.add_bundle({"flow": [("add_imm", addr4, self.scratch["forest_values_p"], 4)]})
-        self.add_bundle({"load": [("load", fs3, addr3), ("load", fs4, addr4)]})
-        self.add_bundle({"flow": [("add_imm", addr5, self.scratch["forest_values_p"], 5)]})
-        self.add_bundle({"flow": [("add_imm", addr6, self.scratch["forest_values_p"], 6)]})
-        self.add_bundle({"load": [("load", fs5, addr5), ("load", fs6, addr6)]})
-        self.add_bundle({"valu": [
-            ("vbroadcast", v_f3, fs3), ("vbroadcast", v_f4, fs4),
-            ("vbroadcast", v_f5, fs5), ("vbroadcast", v_f6, fs6),
-        ]})
+        # OPTIMIZATION: Reuse v_f3, v_f4, v_f5, v_f6 from round 2 (forest[3..6] don't change)
 
         # Pair 0: full processing without overlap
         val_A, val_B = v_val[0], v_val[1]
