@@ -186,18 +186,25 @@ class KernelBuilder:
                     valu_ops.extend([("vbroadcast", vc1, c1), ("vbroadcast", vc2, c2)])
             self.add_bundle({"valu": valu_ops})
 
-        # Load all indices and values - simple approach
-        self.add_bundle({"alu": [("+", ptr, self.scratch["inp_indices_p"], zero_const)]})
-        for i in range(num_batches):
-            self.add_bundle({"load": [("vload", v_idx[i], ptr)]})
-            if i + 1 < num_batches:
-                self.add_bundle({"flow": [("add_imm", ptr, ptr, VLEN)]})
+        # Load all indices and values - optimized with 2 pointers for parallel loads
+        ptr2 = self.alloc_scratch("ptr2_init")
+        vlen2_const = self.scratch_const(VLEN * 2)
 
-        self.add_bundle({"alu": [("+", ptr, self.scratch["inp_values_p"], zero_const)]})
-        for i in range(num_batches):
-            self.add_bundle({"load": [("vload", v_val[i], ptr)]})
-            if i + 1 < num_batches:
-                self.add_bundle({"flow": [("add_imm", ptr, ptr, VLEN)]})
+        # Load indices: 2 vectors per cycle using 2 pointers
+        self.add_bundle({"flow": [("add_imm", ptr, self.scratch["inp_indices_p"], 0)]})
+        self.add_bundle({"flow": [("add_imm", ptr2, self.scratch["inp_indices_p"], VLEN)]})
+        for i in range(0, num_batches, 2):
+            self.add_bundle({"load": [("vload", v_idx[i], ptr), ("vload", v_idx[i + 1], ptr2)]})
+            if i + 2 < num_batches:
+                self.add_bundle({"alu": [("+", ptr, ptr, vlen2_const), ("+", ptr2, ptr2, vlen2_const)]})
+
+        # Load values: same approach
+        self.add_bundle({"flow": [("add_imm", ptr, self.scratch["inp_values_p"], 0)]})
+        self.add_bundle({"flow": [("add_imm", ptr2, self.scratch["inp_values_p"], VLEN)]})
+        for i in range(0, num_batches, 2):
+            self.add_bundle({"load": [("vload", v_val[i], ptr), ("vload", v_val[i + 1], ptr2)]})
+            if i + 2 < num_batches:
+                self.add_bundle({"alu": [("+", ptr, ptr, vlen2_const), ("+", ptr2, ptr2, vlen2_const)]})
 
         self.add_bundle({"load": [("const", num_rounds_s, rounds)]})
         self.add("flow", ("pause",))
