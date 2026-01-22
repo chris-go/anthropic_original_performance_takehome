@@ -1006,22 +1006,26 @@ class KernelBuilder:
                     (op2_3, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
                 ],
             })
-            # Finish idx for batches 2,3 (fixed data dependencies)
+            # Finish idx for batches 2,3 (OPTIMIZED: multiply_add combines <<1 and +1)
+            # Batch 2: idx = idx*2+1, tmp = val&1, idx += tmp  (saves 1 cycle)
+            # Batch 3: same pattern after hash 5 finishes
             self.add_bundle({"valu": [
-                ("&", tmp_list[2][0], batch_info[2][1], v_one), ("<<", batch_info[2][0], batch_info[2][0], v_one),
+                ("multiply_add", batch_info[2][0], batch_info[2][0], v_two, v_one),  # idx*2+1
+                ("&", tmp_list[2][0], batch_info[2][1], v_one),  # tmp = val&1
                 (op1_4, tmp_list[3][0], batch_info[3][1], vc1_4), (op3_4, tmp_list[3][1], batch_info[3][1], vc2_4),
             ]})
             self.add_bundle({"valu": [
-                ("+", tmp_list[2][0], tmp_list[2][0], v_one),
+                ("+", batch_info[2][0], batch_info[2][0], tmp_list[2][0]),  # idx += tmp (batch 2 done)
                 (op2_4, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
             ]})
             self.add_bundle({"valu": [
-                ("+", batch_info[2][0], batch_info[2][0], tmp_list[2][0]),
                 (op1_5, tmp_list[3][0], batch_info[3][1], vc1_5), (op3_5, tmp_list[3][1], batch_info[3][1], vc2_5),
             ]})
             self.add_bundle({"valu": [(op2_5, batch_info[3][1], tmp_list[3][0], tmp_list[3][1])]})
-            self.add_bundle({"valu": [("&", tmp_list[3][0], batch_info[3][1], v_one), ("<<", batch_info[3][0], batch_info[3][0], v_one)]})
-            self.add_bundle({"valu": [("+", tmp_list[3][0], tmp_list[3][0], v_one)]})
+            self.add_bundle({"valu": [
+                ("multiply_add", batch_info[3][0], batch_info[3][0], v_two, v_one),  # idx*2+1
+                ("&", tmp_list[3][0], batch_info[3][1], v_one),  # tmp = val&1
+            ]})
             self.add_bundle({"valu": [("+", batch_info[3][0], batch_info[3][0], tmp_list[3][0])]})
 
         # ===== GROUP 7: Use pre-loaded nodes + PRE-LOAD FOR NEXT ROUND'S GROUP 0 =====
@@ -2123,22 +2127,24 @@ class KernelBuilder:
                         (op2_3, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
                     ],
                 })
-                # Finish idx for batches 2,3
+                # Finish idx for batches 2,3 (OPTIMIZED: multiply_add combines <<1 and +1)
                 self.add_bundle({"valu": [
-                    ("&", tmp_list[2][0], batch_info[2][1], v_one), ("<<", batch_info[2][0], batch_info[2][0], v_one),
+                    ("multiply_add", batch_info[2][0], batch_info[2][0], v_two, v_one),  # idx*2+1
+                    ("&", tmp_list[2][0], batch_info[2][1], v_one),  # tmp = val&1
                     (op1_4, tmp_list[3][0], batch_info[3][1], vc1_4), (op3_4, tmp_list[3][1], batch_info[3][1], vc2_4),
                 ]})
                 self.add_bundle({"valu": [
-                    ("+", tmp_list[2][0], tmp_list[2][0], v_one),
+                    ("+", batch_info[2][0], batch_info[2][0], tmp_list[2][0]),  # idx += tmp (batch 2 done)
                     (op2_4, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
                 ]})
                 self.add_bundle({"valu": [
-                    ("+", batch_info[2][0], batch_info[2][0], tmp_list[2][0]),
                     (op1_5, tmp_list[3][0], batch_info[3][1], vc1_5), (op3_5, tmp_list[3][1], batch_info[3][1], vc2_5),
                 ]})
                 self.add_bundle({"valu": [(op2_5, batch_info[3][1], tmp_list[3][0], tmp_list[3][1])]})
-                self.add_bundle({"valu": [("&", tmp_list[3][0], batch_info[3][1], v_one), ("<<", batch_info[3][0], batch_info[3][0], v_one)]})
-                self.add_bundle({"valu": [("+", tmp_list[3][0], tmp_list[3][0], v_one)]})
+                self.add_bundle({"valu": [
+                    ("multiply_add", batch_info[3][0], batch_info[3][0], v_two, v_one),  # idx*2+1
+                    ("&", tmp_list[3][0], batch_info[3][1], v_one),  # tmp = val&1
+                ]})
                 self.add_bundle({"valu": [("+", batch_info[3][0], batch_info[3][0], tmp_list[3][0])]})
 
             # ===== GROUP 7: Use pre-loaded nodes =====
