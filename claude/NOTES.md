@@ -1,10 +1,10 @@
 # Optimization Notes - Persistent Memory
 
 ## Current State
-- **Cycles**: 3628 (down from 3845 at session start, 3633 after previous session)
+- **Cycles**: 3567 (down from 3845 at session start)
 - **Target**: ~1300 cycles (best known: 1363)
-- **Gap**: Need ~2.8x reduction
-- **Progress this session**: 3633 → 3628 (5 cycles from Round 14-15 pipelining)
+- **Gap**: Need ~2.6x reduction
+- **Progress this session**: 3633 → 3567 (66 cycles, 1.8% improvement)
 
 ## Architecture Constraints (Critical)
 ```
@@ -159,7 +159,11 @@ The 1597 VALU-only bundles (67% of code!) are the primary waste. These represent
   - Group 7 now pre-loads next round's Group 0 nodes during hash computation
   - Applied same optimization to Round 10's Group 0 (-20 cycles)
   - Total improvement: 212 cycles (5.5% reduction)
-- Session 4 (current): Round 14-15 pipelining, detailed analysis
+- Session 4 (current): Round 14-15 pipelining, multiply_add for idx, detailed analysis
   - Round 14 Group 7 pre-loads Round 15 Group 0 batch 0 (-5 cycles)
+  - multiply_add for idx in main loop Groups 1-6 tails (-42 cycles)
+  - multiply_add for idx in Rounds 14-15 Groups 1-6 (-12 cycles)
+  - multiply_add for idx in Round 10 Groups 1-6 and Group 7 (-7 cycles)
+  - Total: 3633 → 3567 (-66 cycles, 1.8% improvement)
   - Identified 67% VALU-only bundles as main waste
   - Theoretical minimum is ~1058 cycles based on VALU ops
