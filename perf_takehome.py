@@ -1580,24 +1580,47 @@ class KernelBuilder:
             (op1_5, v_tmp1_B, prev_val_B, vc1_5), (op3_5, v_tmp2_B, prev_val_B, vc2_5),
         ]})
         self.add_bundle({"valu": [(op2_5, prev_val_A, v_tmp1_A, v_tmp2_A), (op2_5, prev_val_B, v_tmp1_B, v_tmp2_B)]})
-        self.add_bundle({"valu": [
-            ("&", v_tmp1_A, prev_val_A, v_one), ("<<", prev_idx_A, prev_idx_A, v_one),
-            ("&", v_tmp1_B, prev_val_B, v_one), ("<<", prev_idx_B, prev_idx_B, v_one),
-        ]})
-        self.add_bundle({"valu": [("+", v_tmp1_A, v_tmp1_A, v_one), ("+", v_tmp1_B, v_tmp1_B, v_one)]})
-        self.add_bundle({"valu": [("+", prev_idx_A, prev_idx_A, v_tmp1_A), ("+", prev_idx_B, prev_idx_B, v_tmp1_B)]})
+        # OPTIMIZATION: Overlap round 13's idx finish with round 14's address computation
+        # Compute addresses for round 14's batch 0 while finishing round 13's idx
+        base_14 = 0
+        batch_info_14 = [(v_idx[base_14 + i], v_val[base_14 + i]) for i in range(4)]
+        nodes_14 = node_set_A
+
+        self.add_bundle({
+            "alu": [("+", addr_A[i], self.scratch["forest_values_p"], batch_info_14[0][0] + i) for i in range(VLEN)],
+            "valu": [
+                ("&", v_tmp1_A, prev_val_A, v_one), ("<<", prev_idx_A, prev_idx_A, v_one),
+                ("&", v_tmp1_B, prev_val_B, v_one), ("<<", prev_idx_B, prev_idx_B, v_one),
+            ],
+        })
+        self.add_bundle({
+            "load": [("load", nodes_14[0] + 0, addr_A[0]), ("load", nodes_14[0] + 1, addr_A[1])],
+            "valu": [("+", v_tmp1_A, v_tmp1_A, v_one), ("+", v_tmp1_B, v_tmp1_B, v_one)],
+        })
+        self.add_bundle({
+            "load": [("load", nodes_14[0] + 2, addr_A[2]), ("load", nodes_14[0] + 3, addr_A[3])],
+            "valu": [("+", prev_idx_A, prev_idx_A, v_tmp1_A), ("+", prev_idx_B, prev_idx_B, v_tmp1_B)],
+        })
+        self.add_bundle({"load": [("load", nodes_14[0] + 4, addr_A[4]), ("load", nodes_14[0] + 5, addr_A[5])]})
+        self.add_bundle({"load": [("load", nodes_14[0] + 6, addr_A[6]), ("load", nodes_14[0] + 7, addr_A[7])]})
 
         # Rounds 14-15: Use cross-group pre-loading like main loop
         for _round in range(14, 16):
-            # ===== GROUP 0: Full gather (no pre-loaded nodes) =====
-            base = 0
-            batch_info = [(v_idx[base + i], v_val[base + i]) for i in range(4)]
-            nodes = node_set_A
+            if _round == 14:
+                # GROUP 0: Already pre-loaded batch 0 above, start from batch 1
+                base = 0
+                batch_info = [(v_idx[base + i], v_val[base + i]) for i in range(4)]
+                nodes = nodes_14  # Already set
+            else:
+                # GROUP 0: Full gather (no pre-loaded nodes)
+                base = 0
+                batch_info = [(v_idx[base + i], v_val[base + i]) for i in range(4)]
+                nodes = node_set_A
 
-            # Phase 1: Gather batch 0
-            self.add_bundle({"alu": [("+", addr_A[i], self.scratch["forest_values_p"], batch_info[0][0] + i) for i in range(VLEN)]})
-            for i in range(0, VLEN, 2):
-                self.add_bundle({"load": [("load", nodes[0] + i, addr_A[i]), ("load", nodes[0] + i + 1, addr_A[i + 1])]})
+                # Phase 1: Gather batch 0
+                self.add_bundle({"alu": [("+", addr_A[i], self.scratch["forest_values_p"], batch_info[0][0] + i) for i in range(VLEN)]})
+                for i in range(0, VLEN, 2):
+                    self.add_bundle({"load": [("load", nodes[0] + i, addr_A[i]), ("load", nodes[0] + i + 1, addr_A[i + 1])]})
 
             # Phase 2: Gather batch 1 + XOR batch 0 + start hash 0
             self.add_bundle({"alu": [("+", addr_A[i], self.scratch["forest_values_p"], batch_info[1][0] + i) for i in range(VLEN)]})
