@@ -1,9 +1,10 @@
 # Optimization Notes - Persistent Memory
 
 ## Current State
-- **Cycles**: 3845 (down from ~5800 at earlier session start)
+- **Cycles**: 3633 (down from 3845 at previous session start)
 - **Target**: ~1300 cycles (best known: 1363)
-- **Gap**: Need ~2.9x reduction
+- **Gap**: Need ~2.7x reduction
+- **Progress this session**: 3845 → 3633 (212 cycles, 5.5% improvement)
 
 ## Architecture Constraints (Critical)
 ```
@@ -105,3 +106,10 @@ python perf_takehome.py Tests.test_kernel_cycles
 ## Session History
 - Session 1: Baseline optimizations, reached ~4300 cycles
 - Session 2: multiply_add, forest reuse, round overlap → 3845 cycles
+- Session 3: Cross-round pipelining in main loop and Round 10 → 3633 cycles
+  - Applied multiply_add to Group 7 in main loop (-56 cycles)
+  - Applied multiply_add to rounds 14-15 Group 7 (-16 cycles)
+  - Restructured Group 0 to use pre-loaded nodes (-120 cycles)
+  - Group 7 now pre-loads next round's Group 0 nodes during hash computation
+  - Applied same optimization to Round 10's Group 0 (-20 cycles)
+  - Total improvement: 212 cycles (5.5% reduction)
