@@ -341,32 +341,104 @@ class KernelBuilder:
         v_tmp1_F = self.alloc_scratch("v_tmp1_F", VLEN)
         v_tmp2_F = self.alloc_scratch("v_tmp2_F", VLEN)
 
+        # Pre-allocate Round 2's forest value scratch (will load during Round 1 processing)
+        v_f3 = self.alloc_scratch("v_f3", VLEN)
+        v_f4 = self.alloc_scratch("v_f4", VLEN)
+        v_f5 = self.alloc_scratch("v_f5", VLEN)
+        v_f6 = self.alloc_scratch("v_f6", VLEN)
+        addr3 = self.alloc_scratch("addr3")
+        addr4 = self.alloc_scratch("addr4")
+        addr5 = self.alloc_scratch("addr5")
+        addr6 = self.alloc_scratch("addr6")
+        fs3 = self.alloc_scratch("fs3")
+        fs4 = self.alloc_scratch("fs4")
+        fs5 = self.alloc_scratch("fs5")
+        fs6 = self.alloc_scratch("fs6")
+        v_r_odd = self.alloc_scratch("v_r_odd", VLEN)
+        v_r_even = self.alloc_scratch("v_r_even", VLEN)
+
         # Process pairs with pipelining - overlap vselect with previous idx computation
         # Pair 0: full processing without overlap
+        # OPTIMIZED: Add Round 2 forest loading during hash stages
         val_A, val_B = v_val[0], v_val[1]
         idx_A, idx_B = v_idx[0], v_idx[1]
 
-        self.add_bundle({"valu": [("==", v_tmp1_A, idx_A, v_one), ("==", v_tmp1_B, idx_B, v_one)]})
+        # Compare + compute addr3
+        self.add_bundle({
+            "flow": [("add_imm", addr3, self.scratch["forest_values_p"], 3)],
+            "valu": [("==", v_tmp1_A, idx_A, v_one), ("==", v_tmp1_B, idx_B, v_one)],
+        })
         self.add_bundle({"flow": [("vselect", v_node_A, v_tmp1_A, v_node1, v_node2)]})
         self.add_bundle({"flow": [("vselect", v_node_B, v_tmp1_B, v_node1, v_node2)]})
-        self.add_bundle({"valu": [("^", val_A, val_A, v_node_A), ("^", val_B, val_B, v_node_B)]})
+        # XOR + compute addr4
+        self.add_bundle({
+            "flow": [("add_imm", addr4, self.scratch["forest_values_p"], 4)],
+            "valu": [("^", val_A, val_A, v_node_A), ("^", val_B, val_B, v_node_B)],
+        })
 
-        # Hash stages with multiply_add for stages 0, 2, 4
+        # Hash stages with Round 2 forest loading interleaved
         mult_consts = [v_mult_4097, None, v_mult_33, None, v_mult_9, None]
-        for hi in range(6):
-            vc1, vc2 = v_hash_consts[hi]
-            op1, _, op2, op3, _ = HASH_STAGES[hi]
-            if hi in [0, 2, 4]:
-                self.add_bundle({"valu": [
-                    ("multiply_add", val_A, val_A, mult_consts[hi], vc1),
-                    ("multiply_add", val_B, val_B, mult_consts[hi], vc1),
-                ]})
-            else:
-                self.add_bundle({"valu": [
-                    (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
-                    (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
-                ]})
-                self.add_bundle({"valu": [(op2, val_A, v_tmp1_A, v_tmp2_A), (op2, val_B, v_tmp1_B, v_tmp2_B)]})
+        # Stage 0: multiply_add + load fs3, fs4
+        vc1, vc2 = v_hash_consts[0]
+        self.add_bundle({
+            "load": [("load", fs3, addr3), ("load", fs4, addr4)],
+            "valu": [
+                ("multiply_add", val_A, val_A, mult_consts[0], vc1),
+                ("multiply_add", val_B, val_B, mult_consts[0], vc1),
+            ],
+        })
+        # Stage 1 part 1 + compute addr5
+        vc1, vc2 = v_hash_consts[1]
+        op1, _, op2, op3, _ = HASH_STAGES[1]
+        self.add_bundle({
+            "flow": [("add_imm", addr5, self.scratch["forest_values_p"], 5)],
+            "valu": [
+                (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
+                (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
+            ],
+        })
+        # Stage 1 part 2 + compute addr6
+        self.add_bundle({
+            "flow": [("add_imm", addr6, self.scratch["forest_values_p"], 6)],
+            "valu": [(op2, val_A, v_tmp1_A, v_tmp2_A), (op2, val_B, v_tmp1_B, v_tmp2_B)],
+        })
+        # Stage 2: multiply_add + load fs5, fs6
+        vc1, vc2 = v_hash_consts[2]
+        self.add_bundle({
+            "load": [("load", fs5, addr5), ("load", fs6, addr6)],
+            "valu": [
+                ("multiply_add", val_A, val_A, mult_consts[2], vc1),
+                ("multiply_add", val_B, val_B, mult_consts[2], vc1),
+            ],
+        })
+        # Stage 3 part 1 + broadcast v_f3, v_f4
+        vc1, vc2 = v_hash_consts[3]
+        op1, _, op2, op3, _ = HASH_STAGES[3]
+        self.add_bundle({"valu": [
+            (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
+            (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
+            ("vbroadcast", v_f3, fs3), ("vbroadcast", v_f4, fs4),
+        ]})
+        # Stage 3 part 2 + broadcast v_f5, v_f6
+        self.add_bundle({"valu": [
+            (op2, val_A, v_tmp1_A, v_tmp2_A), (op2, val_B, v_tmp1_B, v_tmp2_B),
+            ("vbroadcast", v_f5, fs5), ("vbroadcast", v_f6, fs6),
+        ]})
+        # Stage 4: multiply_add (no more Round 2 loading)
+        vc1, vc2 = v_hash_consts[4]
+        self.add_bundle({"valu": [
+            ("multiply_add", val_A, val_A, mult_consts[4], vc1),
+            ("multiply_add", val_B, val_B, mult_consts[4], vc1),
+        ]})
+        # Stage 5 part 1
+        vc1, vc2 = v_hash_consts[5]
+        op1, _, op2, op3, _ = HASH_STAGES[5]
+        self.add_bundle({"valu": [
+            (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
+            (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
+        ]})
+        # Stage 5 part 2
+        self.add_bundle({"valu": [(op2, val_A, v_tmp1_A, v_tmp2_A), (op2, val_B, v_tmp1_B, v_tmp2_B)]})
 
         # idx = 2*idx + (val%2 + 1) - prepare for next iteration overlap
         self.add_bundle({"valu": [
@@ -427,32 +499,8 @@ class KernelBuilder:
         # ===== ROUND 2 SPECIAL CASE =====
         # Indices are in {3,4,5,6}, so only 4 forest values needed
         # vselect tree: 3 vselects per batch (cheaper than 4 gather cycles)
-        v_f3 = self.alloc_scratch("v_f3", VLEN)
-        v_f4 = self.alloc_scratch("v_f4", VLEN)
-        v_f5 = self.alloc_scratch("v_f5", VLEN)
-        v_f6 = self.alloc_scratch("v_f6", VLEN)
-        addr3 = self.alloc_scratch("addr3")
-        addr4 = self.alloc_scratch("addr4")
-        addr5 = self.alloc_scratch("addr5")
-        addr6 = self.alloc_scratch("addr6")
-        fs3 = self.alloc_scratch("fs3")
-        fs4 = self.alloc_scratch("fs4")
-        fs5 = self.alloc_scratch("fs5")
-        fs6 = self.alloc_scratch("fs6")
-        v_r_odd = self.alloc_scratch("v_r_odd", VLEN)
-        v_r_even = self.alloc_scratch("v_r_even", VLEN)
-
-        # Load forest[3..6]
-        self.add_bundle({"flow": [("add_imm", addr3, self.scratch["forest_values_p"], 3)]})
-        self.add_bundle({"flow": [("add_imm", addr4, self.scratch["forest_values_p"], 4)]})
-        self.add_bundle({"load": [("load", fs3, addr3), ("load", fs4, addr4)]})
-        self.add_bundle({"flow": [("add_imm", addr5, self.scratch["forest_values_p"], 5)]})
-        self.add_bundle({"flow": [("add_imm", addr6, self.scratch["forest_values_p"], 6)]})
-        self.add_bundle({"load": [("load", fs5, addr5), ("load", fs6, addr6)]})
-        self.add_bundle({"valu": [
-            ("vbroadcast", v_f3, fs3), ("vbroadcast", v_f4, fs4),
-            ("vbroadcast", v_f5, fs5), ("vbroadcast", v_f6, fs6),
-        ]})
+        # NOTE: v_f3, v_f4, v_f5, v_f6, addr3-6, fs3-6, v_r_odd, v_r_even
+        # were pre-allocated and loaded during Round 1's processing (optimization)
 
         # Process pairs with pipelining - overlap vselect (flow) with hash (VALU) from previous pair
         # Extra temps for pipelining
