@@ -1,11 +1,11 @@
 # Optimization Notes - Persistent Memory
 
 ## Current State
-- **Cycles**: 3558 (down from 3845 at session start)
+- **Cycles**: 3547 (down from 3845 at session start)
 - **Target**: ~1300 cycles (best known: 1363)
 - **Gap**: Need ~2.6x reduction
-- **First speed test threshold**: < 2164 cycles (need 40% reduction from current)
-- **Progress this session**: 3633 → 3558 (75 cycles, 2.1% improvement)
+- **First speed test threshold**: < 2164 cycles (need 39% reduction from current)
+- **Progress this session**: 3633 → 3547 (86 cycles, 2.4% improvement)
 
 ## Architecture Constraints (Critical)
 ```
@@ -210,8 +210,13 @@ The 1597 VALU-only bundles (67% of code!) are the primary waste. These represent
 - **Utilization**: 50.9% (6300 / 12366)
 - 722 bundles have only 2 VALU ops = major waste
 
-### Next Optimization Targets
-1. **Round 2 vselect block (263 bundles):** Add pre-loading for Round 3's nodes
-2. **Round 13 vselect block (263 bundles):** Add pre-loading for Round 14's nodes
-3. **Round 1 pairs loop:** 15 × 13 VALU-only bundles could have Round 2 forest loads
-4. **Better VALU packing:** Many bundles under-utilized
+### Optimizations Applied in Session 5
+1. **Round 0 → Round 1 pre-loading:** Forest[1,2] loading moved into Round 0's hash processing (-4 cycles)
+2. **Round 1 → Round 2 pre-loading:** Forest[3..6] loading moved into Round 1's hash processing (-7 cycles)
+3. Total: 3558 → 3547 (-11 cycles)
+
+### Remaining Optimization Targets
+1. **Round 2 vselect block (263 bundles):** Convert to gather-based like main loop, or add Round 3 pre-loading
+2. **Round 13 vselect block (263 bundles):** Same approach as Round 2
+3. **Better VALU packing:** Many bundles still under-utilized (avg 3 ops/bundle)
+4. **Gap to first speed test:** 3547 - 2164 = 1383 cycles (39% reduction needed)
