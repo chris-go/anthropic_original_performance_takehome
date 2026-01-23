@@ -1,10 +1,11 @@
 # Optimization Notes - Persistent Memory
 
 ## Current State
-- **Cycles**: 3567 (down from 3845 at session start)
+- **Cycles**: 3558 (down from 3845 at session start)
 - **Target**: ~1300 cycles (best known: 1363)
 - **Gap**: Need ~2.6x reduction
-- **Progress this session**: 3633 → 3567 (66 cycles, 1.8% improvement)
+- **First speed test threshold**: < 2164 cycles (need 40% reduction from current)
+- **Progress this session**: 3633 → 3558 (75 cycles, 2.1% improvement)
 
 ## Architecture Constraints (Critical)
 ```
@@ -164,6 +165,53 @@ The 1597 VALU-only bundles (67% of code!) are the primary waste. These represent
   - multiply_add for idx in main loop Groups 1-6 tails (-42 cycles)
   - multiply_add for idx in Rounds 14-15 Groups 1-6 (-12 cycles)
   - multiply_add for idx in Round 10 Groups 1-6 and Group 7 (-7 cycles)
-  - Total: 3633 → 3567 (-66 cycles, 1.8% improvement)
+  - Round 2 final processing overlapped with Round 3 pre-loading (-7 cycles)
+  - Round 13 final processing overlapped with Round 14 pre-loading (-2 cycles)
+  - Total: 3633 → 3558 (-75 cycles, 2.1% improvement)
   - Identified 67% VALU-only bundles as main waste
   - Theoretical minimum is ~1058 cycles based on VALU ops
+
+## Session 5 Analysis: VALU-only Block Sources
+
+### Cycle Structure (with loop expanded)
+| Section | Static Bundles | Expanded Cycles |
+|---------|----------------|-----------------|
+| Pre-loop (Rounds 0-2) | 772 | 772 |
+| Main loop body | 199 | 1393 (199 × 7) |
+| Post-loop (Rounds 10-15) | 1393 | 1393 |
+| **Total** | 2364 | **3558** |
+
+### VALU-only Run Analysis
+**Pre-loop (604 total VALU-only bundles):**
+- Start 96, Length 133: Round 0-1 processing
+- Start 236-461: Round 1 pairs loop (15 × 13-bundle runs)
+- Start 489, Length 263: **Round 2 vselect processing** (BIGGEST TARGET)
+
+**Post-loop (687 total VALU-only bundles):**
+- Start 1182, Length 27: Round 10 processing
+- Start 1213, Length 133: Round 11-12 processing
+- Start 1348-1588: Round 11-13 pairs loops (15 × 14-bundle runs)
+- Start 1609, Length 263: **Round 13 vselect processing** (SECOND BIGGEST)
+- Various smaller runs for Rounds 14-15
+
+**Key finding:** Main loop (rounds 3-9) has ZERO 10+ bundle VALU-only runs - well optimized!
+
+### VALU Packing Analysis
+| VALU ops/bundle | Count | % |
+|-----------------|-------|---|
+| 1 | 134 | 6.5% |
+| 2 | 722 | 35.0% |
+| 3 | 304 | 14.8% |
+| 4 | 757 | 36.7% |
+| 5 | 82 | 4.0% |
+| 6 | 62 | 3.0% |
+
+- **Average**: 3.06 ops/bundle (max is 6)
+- **Utilization**: 50.9% (6300 / 12366)
+- 722 bundles have only 2 VALU ops = major waste
+
+### Next Optimization Targets
+1. **Round 2 vselect block (263 bundles):** Add pre-loading for Round 3's nodes
+2. **Round 13 vselect block (263 bundles):** Add pre-loading for Round 14's nodes
+3. **Round 1 pairs loop:** 15 × 13 VALU-only bundles could have Round 2 forest loads
+4. **Better VALU packing:** Many bundles under-utilized
