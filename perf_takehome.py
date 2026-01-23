@@ -586,38 +586,12 @@ class KernelBuilder:
             prev_val_A, prev_val_B = val_A, val_B
             prev_idx_A, prev_idx_B = idx_A, idx_B
 
-        # Finish last pair (hash 4-5 + idx)
-        vc1_4, vc2_4 = v_hash_consts[4]
-        op1_4, _, op2_4, op3_4, _ = HASH_STAGES[4]
-        vc1_5, vc2_5 = v_hash_consts[5]
-        op1_5, _, op2_5, op3_5, _ = HASH_STAGES[5]
-        self.add_bundle({"valu": [
-            (op1_4, v_tmp1_A, prev_val_A, vc1_4), (op3_4, v_tmp2_A, prev_val_A, vc2_4),
-            (op1_4, v_tmp1_B, prev_val_B, vc1_4), (op3_4, v_tmp2_B, prev_val_B, vc2_4),
-        ]})
-        self.add_bundle({"valu": [(op2_4, prev_val_A, v_tmp1_A, v_tmp2_A), (op2_4, prev_val_B, v_tmp1_B, v_tmp2_B)]})
-        self.add_bundle({"valu": [
-            (op1_5, v_tmp1_A, prev_val_A, vc1_5), (op3_5, v_tmp2_A, prev_val_A, vc2_5),
-            (op1_5, v_tmp1_B, prev_val_B, vc1_5), (op3_5, v_tmp2_B, prev_val_B, vc2_5),
-        ]})
-        self.add_bundle({"valu": [(op2_5, prev_val_A, v_tmp1_A, v_tmp2_A), (op2_5, prev_val_B, v_tmp1_B, v_tmp2_B)]})
-        self.add_bundle({"valu": [
-            ("&", v_tmp1_A, prev_val_A, v_one), ("<<", prev_idx_A, prev_idx_A, v_one),
-            ("&", v_tmp1_B, prev_val_B, v_one), ("<<", prev_idx_B, prev_idx_B, v_one),
-        ]})
-        self.add_bundle({"valu": [("+", v_tmp1_A, v_tmp1_A, v_one), ("+", v_tmp1_B, v_tmp1_B, v_one)]})
-        self.add_bundle({"valu": [("+", prev_idx_A, prev_idx_A, v_tmp1_A), ("+", prev_idx_B, prev_idx_B, v_tmp1_B)]})
-
-        # ===== MAIN LOOP (rounds 3-9) - PIPELINED with overlapped loads =====
-        # Key insight: Phase 5 has ~19 cycles with NO loads. During those cycles,
-        # we can pre-load the next group's nodes (32 loads = 16 cycles at 2 loads/cycle).
-
-        # Extra temps for 4-batch processing
+        # Finish last pair (hash 4-5 + idx) - OVERLAPPED WITH PRE-LOADING FOR ROUND 3
+        # Allocate node buffers early so we can pre-load during VALU computation
         v_tmp1_D = self.alloc_scratch("v_tmp1_D", VLEN)
         v_tmp2_D = self.alloc_scratch("v_tmp2_D", VLEN)
         tmp_list = [(v_tmp1_A, v_tmp2_A), (v_tmp1_B, v_tmp2_B), (v_tmp1_C, v_tmp2_C), (v_tmp1_D, v_tmp2_D)]
 
-        # Allocate two sets of node storage for double buffering
         v_node_C = self.alloc_scratch("v_node_C", VLEN)
         v_node_D = self.alloc_scratch("v_node_D", VLEN)
         node_set_A = [v_node_A, v_node_B, v_node_C, v_node_D]
@@ -628,14 +602,11 @@ class KernelBuilder:
         v_node_H = self.alloc_scratch("v_node_H", VLEN)
         node_set_B = [v_node_E, v_node_F, v_node_G, v_node_H]
 
-        # Third buffer for 3-way lookahead
         v_node_I = self.alloc_scratch("v_node_I", VLEN)
         v_node_J = self.alloc_scratch("v_node_J", VLEN)
         v_node_K = self.alloc_scratch("v_node_K", VLEN)
         v_node_L = self.alloc_scratch("v_node_L", VLEN)
         node_set_C = [v_node_I, v_node_J, v_node_K, v_node_L]
-
-        # Node sets for 3-way rotation: current, next, next_next
         node_sets = [node_set_A, node_set_B, node_set_C]
 
         # Hash stage constants (extract once for readability)
@@ -652,17 +623,75 @@ class KernelBuilder:
         vc1_5, vc2_5 = v_hash_consts[5]
         op1_5, _, op2_5, op3_5, _ = HASH_STAGES[5]
 
-        # ===== PRE-LOAD ROUND 3's GROUP 0 NODES INTO node_set_C =====
-        # This enables cross-round pipelining: Group 7 pre-loads for next round
-        base = 0
-        batch_info = [(v_idx[base + i], v_val[base + i]) for i in range(4)]
+        # Set up pre-loading: batch 0's nodes will be loaded during this VALU block
+        preload_batch_0_idx = v_idx[0]  # Already computed during Round 2 pair loop
         preload_nodes = node_set_C
 
-        # Load round counter first
-        self.add_bundle({"load": [("const", round_counter, 3)]})
+        # Compute addresses for batch 0 while doing hash stage 4
+        self.add_bundle({
+            "alu": [("+", addr_A[i], self.scratch["forest_values_p"], preload_batch_0_idx + i) for i in range(VLEN)],
+            "valu": [
+                (op1_4, v_tmp1_A, prev_val_A, vc1_4), (op3_4, v_tmp2_A, prev_val_A, vc2_4),
+                (op1_4, v_tmp1_B, prev_val_B, vc1_4), (op3_4, v_tmp2_B, prev_val_B, vc2_4),
+            ],
+        })
+        # Load batch 0 elements 0-1 while finishing hash 4
+        self.add_bundle({
+            "load": [("load", preload_nodes[0] + 0, addr_A[0]), ("load", preload_nodes[0] + 1, addr_A[1])],
+            "valu": [(op2_4, prev_val_A, v_tmp1_A, v_tmp2_A), (op2_4, prev_val_B, v_tmp1_B, v_tmp2_B)],
+        })
+        # Load batch 0 elements 2-3 while doing hash stage 5
+        self.add_bundle({
+            "load": [("load", preload_nodes[0] + 2, addr_A[2]), ("load", preload_nodes[0] + 3, addr_A[3])],
+            "valu": [
+                (op1_5, v_tmp1_A, prev_val_A, vc1_5), (op3_5, v_tmp2_A, prev_val_A, vc2_5),
+                (op1_5, v_tmp1_B, prev_val_B, vc1_5), (op3_5, v_tmp2_B, prev_val_B, vc2_5),
+            ],
+        })
+        # Load batch 0 elements 4-5 while finishing hash 5
+        self.add_bundle({
+            "load": [("load", preload_nodes[0] + 4, addr_A[4]), ("load", preload_nodes[0] + 5, addr_A[5])],
+            "valu": [(op2_5, prev_val_A, v_tmp1_A, v_tmp2_A), (op2_5, prev_val_B, v_tmp1_B, v_tmp2_B)],
+        })
+        # Load batch 0 elements 6-7 while doing idx computation
+        self.add_bundle({
+            "load": [("load", preload_nodes[0] + 6, addr_A[6]), ("load", preload_nodes[0] + 7, addr_A[7])],
+            "valu": [
+                ("&", v_tmp1_A, prev_val_A, v_one), ("<<", prev_idx_A, prev_idx_A, v_one),
+                ("&", v_tmp1_B, prev_val_B, v_one), ("<<", prev_idx_B, prev_idx_B, v_one),
+            ],
+        })
+        # Compute addresses for batch 1 while continuing idx
+        preload_batch_1_idx = v_idx[1]
+        self.add_bundle({
+            "alu": [("+", addr_A[i], self.scratch["forest_values_p"], preload_batch_1_idx + i) for i in range(VLEN)],
+            "valu": [("+", v_tmp1_A, v_tmp1_A, v_one), ("+", v_tmp1_B, v_tmp1_B, v_one)],
+        })
+        # Finish idx + load batch 1 elements 0-1
+        self.add_bundle({
+            "load": [("load", preload_nodes[1] + 0, addr_A[0]), ("load", preload_nodes[1] + 1, addr_A[1])],
+            "valu": [("+", prev_idx_A, prev_idx_A, v_tmp1_A), ("+", prev_idx_B, prev_idx_B, v_tmp1_B)],
+        })
 
-        # Load all 4 batches' nodes into node_set_C (32 loads = 16 bundles at 2/cycle)
-        for b in range(4):
+        # ===== MAIN LOOP (rounds 3-9) - PIPELINED with overlapped loads =====
+        # Key insight: Phase 5 has ~19 cycles with NO loads. During those cycles,
+        # we can pre-load the next group's nodes (32 loads = 16 cycles at 2 loads/cycle).
+
+        # ===== PRE-LOAD ROUND 3's GROUP 0 NODES INTO node_set_C =====
+        # Batches 0-1 were already loaded during Round 2's final processing
+        # Now just need to load batches 2-3 and the round counter
+        base = 0
+        batch_info = [(v_idx[base + i], v_val[base + i]) for i in range(4)]
+        preload_nodes = node_set_C  # Already partially loaded (batches 0-1)
+
+        # Load round counter + batch 1 elements 2-3
+        self.add_bundle({"load": [("const", round_counter, 3), ("load", preload_nodes[1] + 2, addr_A[2])]})
+        self.add_bundle({"load": [("load", preload_nodes[1] + 3, addr_A[3]), ("load", preload_nodes[1] + 4, addr_A[4])]})
+        self.add_bundle({"load": [("load", preload_nodes[1] + 5, addr_A[5]), ("load", preload_nodes[1] + 6, addr_A[6])]})
+        self.add_bundle({"load": [("load", preload_nodes[1] + 7, addr_A[7])]})
+
+        # Load batches 2-3 (16 loads = 8 bundles)
+        for b in range(2, 4):
             self.add_bundle({"alu": [("+", addr_A[i], self.scratch["forest_values_p"], batch_info[b][0] + i) for i in range(VLEN)]})
             for i in range(0, VLEN, 2):
                 self.add_bundle({"load": [("load", preload_nodes[b] + i, addr_A[i]), ("load", preload_nodes[b] + i + 1, addr_A[i + 1])]})
