@@ -241,12 +241,28 @@ class KernelBuilder:
         v_tmp1_E = self.alloc_scratch("v_tmp1_E", VLEN)
         v_tmp2_E = self.alloc_scratch("v_tmp2_E", VLEN)
 
-        # Load forest[0] once and broadcast
-        self.add_bundle({"load": [("load", node_scalar, self.scratch["forest_values_p"])]})
-        self.add_bundle({"valu": [("vbroadcast", v_node_shared, node_scalar)]})
+        # Pre-allocate Round 1's forest value scratch (will load during Round 0 processing)
+        node1_scalar = self.alloc_scratch("node1_scalar")
+        node2_scalar = self.alloc_scratch("node2_scalar")
+        v_node1 = self.alloc_scratch("v_node1", VLEN)
+        v_node2 = self.alloc_scratch("v_node2", VLEN)
+        addr1 = self.alloc_scratch("addr1")
+        addr2 = self.alloc_scratch("addr2")
+
+        # Load forest[0] once and broadcast + compute addr1 for Round 1
+        self.add_bundle({
+            "flow": [("add_imm", addr1, self.scratch["forest_values_p"], 1)],
+            "load": [("load", node_scalar, self.scratch["forest_values_p"])],
+        })
+        # Broadcast + compute addr2 for Round 1
+        self.add_bundle({
+            "flow": [("add_imm", addr2, self.scratch["forest_values_p"], 2)],
+            "valu": [("vbroadcast", v_node_shared, node_scalar)],
+        })
 
         # Process 3 batches at a time (uses all 6 VALU slots for hash ops)
         # 32 batches = 10 groups of 3 + 1 group of 2
+        # OPTIMIZED: Group 0 adds Round 1's forest loading
         for group in range(11):
             if group < 10:
                 # 3 batches at a time
@@ -254,11 +270,21 @@ class KernelBuilder:
                 val_A, val_B, val_C = v_val[b], v_val[b + 1], v_val[b + 2]
                 idx_A, idx_B, idx_C = v_idx[b], v_idx[b + 1], v_idx[b + 2]
 
-                # XOR all 3 batches with shared node
-                self.add_bundle({"valu": [
-                    ("^", val_A, val_A, v_node_shared), ("^", val_B, val_B, v_node_shared),
-                    ("^", val_C, val_C, v_node_shared),
-                ]})
+                if group == 0:
+                    # Group 0: XOR + load Round 1's forest values
+                    self.add_bundle({
+                        "load": [("load", node1_scalar, addr1), ("load", node2_scalar, addr2)],
+                        "valu": [
+                            ("^", val_A, val_A, v_node_shared), ("^", val_B, val_B, v_node_shared),
+                            ("^", val_C, val_C, v_node_shared),
+                        ],
+                    })
+                else:
+                    # Groups 1-9: XOR only
+                    self.add_bundle({"valu": [
+                        ("^", val_A, val_A, v_node_shared), ("^", val_B, val_B, v_node_shared),
+                        ("^", val_C, val_C, v_node_shared),
+                    ]})
 
                 # Hash stages 0-5 for all 3 batches
                 # Stages 0, 2, 4: use multiply_add (saves 1 cycle each)
@@ -268,12 +294,22 @@ class KernelBuilder:
                     vc1, vc2 = v_hash_consts[hi]
                     op1, _, op2, op3, _ = HASH_STAGES[hi]
                     if hi in [0, 2, 4]:
-                        # multiply_add: val = val * mult + const
-                        self.add_bundle({"valu": [
-                            ("multiply_add", val_A, val_A, mult_consts[hi], vc1),
-                            ("multiply_add", val_B, val_B, mult_consts[hi], vc1),
-                            ("multiply_add", val_C, val_C, mult_consts[hi], vc1),
-                        ]})
+                        if group == 0 and hi == 0:
+                            # Group 0, Stage 0: multiply_add + vbroadcast Round 1's nodes
+                            self.add_bundle({"valu": [
+                                ("multiply_add", val_A, val_A, mult_consts[hi], vc1),
+                                ("multiply_add", val_B, val_B, mult_consts[hi], vc1),
+                                ("multiply_add", val_C, val_C, mult_consts[hi], vc1),
+                                ("vbroadcast", v_node1, node1_scalar),
+                                ("vbroadcast", v_node2, node2_scalar),
+                            ]})
+                        else:
+                            # multiply_add: val = val * mult + const
+                            self.add_bundle({"valu": [
+                                ("multiply_add", val_A, val_A, mult_consts[hi], vc1),
+                                ("multiply_add", val_B, val_B, mult_consts[hi], vc1),
+                                ("multiply_add", val_C, val_C, mult_consts[hi], vc1),
+                            ]})
                     else:
                         # Original 2-cycle approach
                         self.add_bundle({"valu": [
@@ -324,18 +360,8 @@ class KernelBuilder:
         # ===== ROUND 1 SPECIAL CASE =====
         # All indices are in {1, 2}, so we only need 2 forest loads!
         # PIPELINED: overlap vselect (flow) with idx computation (VALU) from previous pair
-        node1_scalar = self.alloc_scratch("node1_scalar")
-        node2_scalar = self.alloc_scratch("node2_scalar")
-        v_node1 = self.alloc_scratch("v_node1", VLEN)
-        v_node2 = self.alloc_scratch("v_node2", VLEN)
-        addr1 = self.alloc_scratch("addr1")
-        addr2 = self.alloc_scratch("addr2")
-
-        # Compute addresses and load forest[1] and forest[2]
-        self.add_bundle({"flow": [("add_imm", addr1, self.scratch["forest_values_p"], 1)]})
-        self.add_bundle({"flow": [("add_imm", addr2, self.scratch["forest_values_p"], 2)]})
-        self.add_bundle({"load": [("load", node1_scalar, addr1), ("load", node2_scalar, addr2)]})
-        self.add_bundle({"valu": [("vbroadcast", v_node1, node1_scalar), ("vbroadcast", v_node2, node2_scalar)]})
+        # NOTE: node1_scalar, node2_scalar, v_node1, v_node2, addr1, addr2
+        # were pre-allocated and loaded during Round 0's processing (optimization)
 
         # Extra temps for pipelining (C batch for overlap)
         v_tmp1_F = self.alloc_scratch("v_tmp1_F", VLEN)
