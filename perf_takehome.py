@@ -123,6 +123,7 @@ class KernelBuilder:
         mult_4097 = self.preload_const(4097)
         mult_33 = self.preload_const(33)
         mult_9 = self.preload_const(9)
+        ten_const = self.preload_const(10)
 
         # Memory layout
         init_vars = ["rounds", "n_nodes", "batch_size", "forest_height",
@@ -145,9 +146,13 @@ class KernelBuilder:
         # All node values for gather-first approach (256 values = 32 batches * 8)
         v_nodes = [self.alloc_scratch(f"v_nodes_{i}", VLEN) for i in range(num_batches)]
 
-        # Extra temps for 3-way hash parallelism
+        # Extra temps for hash parallelism (6-batch processing needs 6 pairs)
         v_tmp1_C = self.alloc_scratch("v_tmp1_C", VLEN)
         v_tmp2_C = self.alloc_scratch("v_tmp2_C", VLEN)
+        v_tmp1_D = self.alloc_scratch("v_tmp1_D", VLEN)
+        v_tmp2_D = self.alloc_scratch("v_tmp2_D", VLEN)
+        v_tmp1_F = self.alloc_scratch("v_tmp1_F", VLEN)
+        v_tmp2_F = self.alloc_scratch("v_tmp2_F", VLEN)
 
         v_one = self.alloc_scratch("v_one", VLEN)
         v_two = self.alloc_scratch("v_two", VLEN)
@@ -237,93 +242,70 @@ class KernelBuilder:
         node_scalar = self.alloc_scratch("node_scalar")
         v_node_shared = self.alloc_scratch("v_node_shared", VLEN)
 
-        # Extra temps for 3-batch processing
+        # Extra temps for 6-batch processing
         v_tmp1_E = self.alloc_scratch("v_tmp1_E", VLEN)
         v_tmp2_E = self.alloc_scratch("v_tmp2_E", VLEN)
+        tmp6 = [(v_tmp1_A, v_tmp2_A), (v_tmp1_B, v_tmp2_B), (v_tmp1_E, v_tmp2_E),
+                (v_tmp1_C, v_tmp2_C), (v_tmp1_D, v_tmp2_D), (v_tmp1_F, v_tmp2_F)]
 
         # Load forest[0] once and broadcast
         self.add_bundle({"load": [("load", node_scalar, self.scratch["forest_values_p"])]})
         self.add_bundle({"valu": [("vbroadcast", v_node_shared, node_scalar)]})
 
-        # Process 3 batches at a time (uses all 6 VALU slots for hash ops)
-        # 32 batches = 10 groups of 3 + 1 group of 2
-        for group in range(11):
-            if group < 10:
-                # 3 batches at a time
-                b = group * 3
-                val_A, val_B, val_C = v_val[b], v_val[b + 1], v_val[b + 2]
-                idx_A, idx_B, idx_C = v_idx[b], v_idx[b + 1], v_idx[b + 2]
-
-                # XOR all 3 batches with shared node
-                self.add_bundle({"valu": [
-                    ("^", val_A, val_A, v_node_shared), ("^", val_B, val_B, v_node_shared),
-                    ("^", val_C, val_C, v_node_shared),
-                ]})
-
-                # Hash stages 0-5 for all 3 batches
-                # Stages 0, 2, 4: use multiply_add (saves 1 cycle each)
-                # Stages 1, 3, 5: use original 2-cycle approach
-                mult_consts = [v_mult_4097, None, v_mult_33, None, v_mult_9, None]
-                for hi in range(6):
-                    vc1, vc2 = v_hash_consts[hi]
-                    op1, _, op2, op3, _ = HASH_STAGES[hi]
-                    if hi in [0, 2, 4]:
-                        # multiply_add: val = val * mult + const
-                        self.add_bundle({"valu": [
-                            ("multiply_add", val_A, val_A, mult_consts[hi], vc1),
-                            ("multiply_add", val_B, val_B, mult_consts[hi], vc1),
-                            ("multiply_add", val_C, val_C, mult_consts[hi], vc1),
-                        ]})
-                    else:
-                        # Original 2-cycle approach
-                        self.add_bundle({"valu": [
-                            (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
-                            (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
-                            (op1, v_tmp1_E, val_C, vc1), (op3, v_tmp2_E, val_C, vc2),
-                        ]})
-                        self.add_bundle({"valu": [
-                            (op2, val_A, v_tmp1_A, v_tmp2_A),
-                            (op2, val_B, v_tmp1_B, v_tmp2_B),
-                            (op2, val_C, v_tmp1_E, v_tmp2_E),
-                        ]})
-
-                # idx = (val & 1) + 1
-                self.add_bundle({"valu": [
-                    ("&", idx_A, val_A, v_one), ("&", idx_B, val_B, v_one), ("&", idx_C, val_C, v_one),
-                ]})
-                self.add_bundle({"valu": [
-                    ("+", idx_A, idx_A, v_one), ("+", idx_B, idx_B, v_one), ("+", idx_C, idx_C, v_one),
-                ]})
+        # Process 6 batches at a time (saturates 6 VALU slots)
+        # 32 batches = 5 groups of 6 + 1 group of 2
+        mult_consts = [v_mult_4097, None, v_mult_33, None, v_mult_9, None]
+        for group in range(6):
+            if group < 5:
+                b = group * 6
+                vals = [v_val[b + i] for i in range(6)]
+                idxs = [v_idx[b + i] for i in range(6)]
+                n = 6
             else:
-                # Last 2 batches (batches 30-31)
                 b = 30
-                val_A, val_B = v_val[b], v_val[b + 1]
-                idx_A, idx_B = v_idx[b], v_idx[b + 1]
+                vals = [v_val[b], v_val[b + 1]]
+                idxs = [v_idx[b], v_idx[b + 1]]
+                n = 2
 
-                self.add_bundle({"valu": [("^", val_A, val_A, v_node_shared), ("^", val_B, val_B, v_node_shared)]})
+            # XOR with shared node
+            self.add_bundle({"valu": [("^", vals[i], vals[i], v_node_shared) for i in range(n)]})
 
-                mult_consts = [v_mult_4097, None, v_mult_33, None, v_mult_9, None]
-                for hi in range(6):
-                    vc1, vc2 = v_hash_consts[hi]
-                    op1, _, op2, op3, _ = HASH_STAGES[hi]
-                    if hi in [0, 2, 4]:
+            # Hash stages 0-5
+            for hi in range(6):
+                vc1, vc2 = v_hash_consts[hi]
+                op1, _, op2, op3, _ = HASH_STAGES[hi]
+                if hi in [0, 2, 4]:
+                    self.add_bundle({"valu": [
+                        ("multiply_add", vals[i], vals[i], mult_consts[hi], vc1) for i in range(n)
+                    ]})
+                else:
+                    if n > 3:
+                        # Split part 1 into 2 cycles (6 ops each)
                         self.add_bundle({"valu": [
-                            ("multiply_add", val_A, val_A, mult_consts[hi], vc1),
-                            ("multiply_add", val_B, val_B, mult_consts[hi], vc1),
+                            op for i in range(3) for op in [
+                                (op1, tmp6[i][0], vals[i], vc1), (op3, tmp6[i][1], vals[i], vc2),
+                            ]
+                        ]})
+                        self.add_bundle({"valu": [
+                            op for i in range(3, n) for op in [
+                                (op1, tmp6[i][0], vals[i], vc1), (op3, tmp6[i][1], vals[i], vc2),
+                            ]
                         ]})
                     else:
                         self.add_bundle({"valu": [
-                            (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
-                            (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
+                            op for i in range(n) for op in [
+                                (op1, tmp6[i][0], vals[i], vc1), (op3, tmp6[i][1], vals[i], vc2),
+                            ]
                         ]})
-                        self.add_bundle({"valu": [(op2, val_A, v_tmp1_A, v_tmp2_A), (op2, val_B, v_tmp1_B, v_tmp2_B)]})
+                    self.add_bundle({"valu": [(op2, vals[i], tmp6[i][0], tmp6[i][1]) for i in range(n)]})
 
-                self.add_bundle({"valu": [("&", idx_A, val_A, v_one), ("&", idx_B, val_B, v_one)]})
-                self.add_bundle({"valu": [("+", idx_A, idx_A, v_one), ("+", idx_B, idx_B, v_one)]})
+            # idx = (val & 1) + 1 (round 0: all idx start at 0, so new_idx = branch)
+            self.add_bundle({"valu": [("&", idxs[i], vals[i], v_one) for i in range(n)]})
+            self.add_bundle({"valu": [("+", idxs[i], idxs[i], v_one) for i in range(n)]})
 
         # ===== ROUND 1 SPECIAL CASE =====
         # All indices are in {1, 2}, so we only need 2 forest loads!
-        # PIPELINED: overlap vselect (flow) with idx computation (VALU) from previous pair
+        # ARITHMETIC APPROACH: node_val = idx * diff + base2 (eliminates flow bottleneck)
         node1_scalar = self.alloc_scratch("node1_scalar")
         node2_scalar = self.alloc_scratch("node2_scalar")
         v_node1 = self.alloc_scratch("v_node1", VLEN)
@@ -331,102 +313,97 @@ class KernelBuilder:
         addr1 = self.alloc_scratch("addr1")
         addr2 = self.alloc_scratch("addr2")
 
-        # Compute addresses and load forest[1] and forest[2]
-        self.add_bundle({"flow": [("add_imm", addr1, self.scratch["forest_values_p"], 1)]})
-        self.add_bundle({"flow": [("add_imm", addr2, self.scratch["forest_values_p"], 2)]})
-        self.add_bundle({"load": [("load", node1_scalar, addr1), ("load", node2_scalar, addr2)]})
-        self.add_bundle({"valu": [("vbroadcast", v_node1, node1_scalar), ("vbroadcast", v_node2, node2_scalar)]})
+        # Extra allocations for arithmetic approach
+        diff_12_scalar = self.alloc_scratch("diff_12_scalar")
+        base2_12_scalar = self.alloc_scratch("base2_12_scalar")
+        v_diff_12 = self.alloc_scratch("v_diff_12", VLEN)
+        v_base2_12 = self.alloc_scratch("v_base2_12", VLEN)
 
-        # Extra temps for pipelining (C batch for overlap)
+        # Extra temps for pipelining (F batch)
         v_tmp1_F = self.alloc_scratch("v_tmp1_F", VLEN)
         v_tmp2_F = self.alloc_scratch("v_tmp2_F", VLEN)
 
-        # Process pairs with pipelining - overlap vselect with previous idx computation
-        # Pair 0: full processing without overlap
-        val_A, val_B = v_val[0], v_val[1]
-        idx_A, idx_B = v_idx[0], v_idx[1]
-
-        self.add_bundle({"valu": [("==", v_tmp1_A, idx_A, v_one), ("==", v_tmp1_B, idx_B, v_one)]})
-        self.add_bundle({"flow": [("vselect", v_node_A, v_tmp1_A, v_node1, v_node2)]})
-        self.add_bundle({"flow": [("vselect", v_node_B, v_tmp1_B, v_node1, v_node2)]})
-        self.add_bundle({"valu": [("^", val_A, val_A, v_node_A), ("^", val_B, val_B, v_node_B)]})
-
-        # Hash stages with multiply_add for stages 0, 2, 4
-        mult_consts = [v_mult_4097, None, v_mult_33, None, v_mult_9, None]
-        for hi in range(6):
-            vc1, vc2 = v_hash_consts[hi]
-            op1, _, op2, op3, _ = HASH_STAGES[hi]
-            if hi in [0, 2, 4]:
-                self.add_bundle({"valu": [
-                    ("multiply_add", val_A, val_A, mult_consts[hi], vc1),
-                    ("multiply_add", val_B, val_B, mult_consts[hi], vc1),
-                ]})
-            else:
-                self.add_bundle({"valu": [
-                    (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
-                    (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
-                ]})
-                self.add_bundle({"valu": [(op2, val_A, v_tmp1_A, v_tmp2_A), (op2, val_B, v_tmp1_B, v_tmp2_B)]})
-
-        # idx = 2*idx + (val%2 + 1) - prepare for next iteration overlap
-        self.add_bundle({"valu": [
-            ("&", v_tmp1_A, val_A, v_one), ("<<", idx_A, idx_A, v_one),
-            ("&", v_tmp1_B, val_B, v_one), ("<<", idx_B, idx_B, v_one),
+        # Compute addresses using ALU (both in one cycle)
+        self.add_bundle({"alu": [
+            ("+", addr1, self.scratch["forest_values_p"], one_const),
+            ("+", addr2, self.scratch["forest_values_p"], two_const),
         ]})
-        self.add_bundle({"valu": [("+", v_tmp1_A, v_tmp1_A, v_one), ("+", v_tmp1_B, v_tmp1_B, v_one)]})
-        # Save prev values for overlap
-        prev_idx_A, prev_idx_B = idx_A, idx_B
-        prev_tmp1_A, prev_tmp1_B = v_tmp1_A, v_tmp1_B
 
-        # Pairs 1-15: overlapped processing
-        for b in range(2, num_batches, 2):
-            val_A, val_B = v_val[b], v_val[b + 1]
-            idx_A, idx_B = v_idx[b], v_idx[b + 1]
+        # Load forest[1] and forest[2]
+        self.add_bundle({"load": [("load", node1_scalar, addr1), ("load", node2_scalar, addr2)]})
 
-            # Compare for current + idx add for previous
+        # Compute diff = f2 - f1, base2 = f1 - diff = 2*f1 - f2, overlapped with broadcasts
+        self.add_bundle({
+            "alu": [("-", diff_12_scalar, node2_scalar, node1_scalar)],
+            "valu": [("vbroadcast", v_node1, node1_scalar), ("vbroadcast", v_node2, node2_scalar)],
+        })
+        self.add_bundle({
+            "alu": [("-", base2_12_scalar, node1_scalar, diff_12_scalar)],
+            "valu": [("vbroadcast", v_diff_12, diff_12_scalar)],
+        })
+        self.add_bundle({"valu": [("vbroadcast", v_base2_12, base2_12_scalar)]})
+
+        # Process in groups of 6 batches (5 groups of 6 + 1 group of 2)
+        tmp6 = [(v_tmp1_A, v_tmp2_A), (v_tmp1_B, v_tmp2_B), (v_tmp1_E, v_tmp2_E),
+                (v_tmp1_C, v_tmp2_C), (v_tmp1_D, v_tmp2_D), (v_tmp1_F, v_tmp2_F)]
+        node_tmp6 = [v_node_A, v_node_B, v_tmp1_E, v_tmp1_C, v_tmp1_D, v_tmp1_F]
+        mult_consts = [v_mult_4097, None, v_mult_33, None, v_mult_9, None]
+        for group in range(6):
+            if group < 5:
+                b = group * 6
+                vals = [v_val[b + i] for i in range(6)]
+                idxs = [v_idx[b + i] for i in range(6)]
+                n = 6
+            else:
+                b = 30
+                vals = [v_val[b], v_val[b + 1]]
+                idxs = [v_idx[b], v_idx[b + 1]]
+                n = 2
+
+            # Node lookup: node_val = idx * diff + base2 (1 cycle)
             self.add_bundle({"valu": [
-                ("==", v_tmp1_F, idx_A, v_one), ("==", v_tmp2_F, idx_B, v_one),
-                ("+", prev_idx_A, prev_idx_A, prev_tmp1_A), ("+", prev_idx_B, prev_idx_B, prev_tmp1_B),
+                ("multiply_add", node_tmp6[i], idxs[i], v_diff_12, v_base2_12) for i in range(n)
             ]})
-            # vselect A for current (no bounds check needed - idx always < n_nodes)
-            self.add_bundle({"flow": [("vselect", v_node_A, v_tmp1_F, v_node1, v_node2)]})
-            # vselect B for current
-            self.add_bundle({"flow": [("vselect", v_node_B, v_tmp2_F, v_node1, v_node2)]})
-            # XOR for current
-            self.add_bundle({"valu": [("^", val_A, val_A, v_node_A), ("^", val_B, val_B, v_node_B)]})
 
-            # Hash stages with multiply_add for stages 0, 2, 4
-            mult_consts = [v_mult_4097, None, v_mult_33, None, v_mult_9, None]
+            # XOR val with node
+            self.add_bundle({"valu": [("^", vals[i], vals[i], node_tmp6[i]) for i in range(n)]})
+
+            # Hash stages 0-5
             for hi in range(6):
                 vc1, vc2 = v_hash_consts[hi]
                 op1, _, op2, op3, _ = HASH_STAGES[hi]
                 if hi in [0, 2, 4]:
                     self.add_bundle({"valu": [
-                        ("multiply_add", val_A, val_A, mult_consts[hi], vc1),
-                        ("multiply_add", val_B, val_B, mult_consts[hi], vc1),
+                        ("multiply_add", vals[i], vals[i], mult_consts[hi], vc1) for i in range(n)
                     ]})
                 else:
-                    self.add_bundle({"valu": [
-                        (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
-                        (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
-                    ]})
-                    self.add_bundle({"valu": [(op2, val_A, v_tmp1_A, v_tmp2_A), (op2, val_B, v_tmp1_B, v_tmp2_B)]})
+                    if n > 3:
+                        self.add_bundle({"valu": [
+                            op for i in range(3) for op in [
+                                (op1, tmp6[i][0], vals[i], vc1), (op3, tmp6[i][1], vals[i], vc2),
+                            ]
+                        ]})
+                        self.add_bundle({"valu": [
+                            op for i in range(3, n) for op in [
+                                (op1, tmp6[i][0], vals[i], vc1), (op3, tmp6[i][1], vals[i], vc2),
+                            ]
+                        ]})
+                    else:
+                        self.add_bundle({"valu": [
+                            op for i in range(n) for op in [
+                                (op1, tmp6[i][0], vals[i], vc1), (op3, tmp6[i][1], vals[i], vc2),
+                            ]
+                        ]})
+                    self.add_bundle({"valu": [(op2, vals[i], tmp6[i][0], tmp6[i][1]) for i in range(n)]})
 
-            # idx computation - prepare for next overlap
-            self.add_bundle({"valu": [
-                ("&", v_tmp1_A, val_A, v_one), ("<<", idx_A, idx_A, v_one),
-                ("&", v_tmp1_B, val_B, v_one), ("<<", idx_B, idx_B, v_one),
-            ]})
-            self.add_bundle({"valu": [("+", v_tmp1_A, v_tmp1_A, v_one), ("+", v_tmp1_B, v_tmp1_B, v_one)]})
-            prev_idx_A, prev_idx_B = idx_A, idx_B
-            prev_tmp1_A, prev_tmp1_B = v_tmp1_A, v_tmp1_B
-
-        # Finish last pair's idx (no bounds check needed - idx always < n_nodes)
-        self.add_bundle({"valu": [("+", prev_idx_A, prev_idx_A, prev_tmp1_A), ("+", prev_idx_B, prev_idx_B, prev_tmp1_B)]})
+            # idx = 2*idx + (val&1 + 1) (3 cycles)
+            self.add_bundle({"valu": [("&", tmp6[i][0], vals[i], v_one) for i in range(n)]})
+            self.add_bundle({"valu": [("+", tmp6[i][0], tmp6[i][0], v_one) for i in range(n)]})
+            self.add_bundle({"valu": [("multiply_add", idxs[i], idxs[i], v_two, tmp6[i][0]) for i in range(n)]})
 
         # ===== ROUND 2 SPECIAL CASE =====
         # Indices are in {3,4,5,6}, so only 4 forest values needed
-        # vselect tree: 3 vselects per batch (cheaper than 4 gather cycles)
+        # ARITHMETIC APPROACH: eliminates 6 vselects per pair with 5 VALU cycles per 3 batches
         v_f3 = self.alloc_scratch("v_f3", VLEN)
         v_f4 = self.alloc_scratch("v_f4", VLEN)
         v_f5 = self.alloc_scratch("v_f5", VLEN)
@@ -439,185 +416,152 @@ class KernelBuilder:
         fs4 = self.alloc_scratch("fs4")
         fs5 = self.alloc_scratch("fs5")
         fs6 = self.alloc_scratch("fs6")
+
+        # Allocations for arithmetic approach
+        diff_34_scalar = self.alloc_scratch("diff_34_scalar")
+        diff_56_scalar = self.alloc_scratch("diff_56_scalar")
+        v_diff_34 = self.alloc_scratch("v_diff_34", VLEN)
+        v_diff_56 = self.alloc_scratch("v_diff_56", VLEN)
+        three_const_s = self.scratch_const(3)
+        v_three = self.alloc_scratch("v_three", VLEN)
+
+        # These scratch vars were previously used for vselect but we still need them as temps
         v_r_odd = self.alloc_scratch("v_r_odd", VLEN)
         v_r_even = self.alloc_scratch("v_r_even", VLEN)
-
-        # Load forest[3..6]
-        self.add_bundle({"flow": [("add_imm", addr3, self.scratch["forest_values_p"], 3)]})
-        self.add_bundle({"flow": [("add_imm", addr4, self.scratch["forest_values_p"], 4)]})
-        self.add_bundle({"load": [("load", fs3, addr3), ("load", fs4, addr4)]})
-        self.add_bundle({"flow": [("add_imm", addr5, self.scratch["forest_values_p"], 5)]})
-        self.add_bundle({"flow": [("add_imm", addr6, self.scratch["forest_values_p"], 6)]})
-        self.add_bundle({"load": [("load", fs5, addr5), ("load", fs6, addr6)]})
-        self.add_bundle({"valu": [
-            ("vbroadcast", v_f3, fs3), ("vbroadcast", v_f4, fs4),
-            ("vbroadcast", v_f5, fs5), ("vbroadcast", v_f6, fs6),
-        ]})
-
-        # Process pairs with pipelining - overlap vselect (flow) with hash (VALU) from previous pair
-        # Extra temps for pipelining
         v_bit0_C = self.alloc_scratch("v_bit0_C", VLEN)
         v_bit1_C = self.alloc_scratch("v_bit1_C", VLEN)
         v_bit0_D = self.alloc_scratch("v_bit0_D", VLEN)
         v_bit1_D = self.alloc_scratch("v_bit1_D", VLEN)
 
-        # Pair 0: full processing without overlap
-        val_A, val_B = v_val[0], v_val[1]
-        idx_A, idx_B = v_idx[0], v_idx[1]
-
-        self.add_bundle({"valu": [
-            ("&", v_tmp1_A, idx_A, v_one), (">>", v_tmp2_A, idx_A, v_one),
-            ("&", v_tmp1_B, idx_B, v_one), (">>", v_tmp2_B, idx_B, v_one),
+        # Load forest[3..6]
+        self.add_bundle({"alu": [
+            ("+", addr3, self.scratch["forest_values_p"], three_const_s),
         ]})
-        self.add_bundle({"valu": [("&", v_tmp2_A, v_tmp2_A, v_one), ("&", v_tmp2_B, v_tmp2_B, v_one)]})
-        self.add_bundle({"flow": [("vselect", v_r_odd, v_tmp2_A, v_f3, v_f5)]})
-        self.add_bundle({"flow": [("vselect", v_r_even, v_tmp2_A, v_f6, v_f4)]})
-        self.add_bundle({"flow": [("vselect", v_node_A, v_tmp1_A, v_r_odd, v_r_even)]})
-        self.add_bundle({"flow": [("vselect", v_r_odd, v_tmp2_B, v_f3, v_f5)]})
-        self.add_bundle({"flow": [("vselect", v_r_even, v_tmp2_B, v_f6, v_f4)]})
-        self.add_bundle({"flow": [("vselect", v_node_B, v_tmp1_B, v_r_odd, v_r_even)]})
-        self.add_bundle({"valu": [("^", val_A, val_A, v_node_A), ("^", val_B, val_B, v_node_B)]})
+        self.add_bundle({"flow": [("add_imm", addr4, self.scratch["forest_values_p"], 4)]})
+        self.add_bundle({"load": [("load", fs3, addr3), ("load", fs4, addr4)]})
+        self.add_bundle({"flow": [("add_imm", addr5, self.scratch["forest_values_p"], 5)]})
+        self.add_bundle({"flow": [("add_imm", addr6, self.scratch["forest_values_p"], 6)]})
+        self.add_bundle({"load": [("load", fs5, addr5), ("load", fs6, addr6)]})
 
-        # Hash stages 0-3 with multiply_add for stages 0, 2
-        mult_consts = [v_mult_4097, None, v_mult_33, None]
-        for hi in range(4):
-            vc1, vc2 = v_hash_consts[hi]
-            op1, _, op2, op3, _ = HASH_STAGES[hi]
-            if hi in [0, 2]:
+        # Compute diffs and broadcast
+        self.add_bundle({
+            "alu": [("-", diff_34_scalar, fs4, fs3), ("-", diff_56_scalar, fs6, fs5)],
+            "valu": [
+                ("vbroadcast", v_f3, fs3), ("vbroadcast", v_f4, fs4),
+                ("vbroadcast", v_f5, fs5), ("vbroadcast", v_f6, fs6),
+            ],
+        })
+        self.add_bundle({"valu": [
+            ("vbroadcast", v_diff_34, diff_34_scalar),
+            ("vbroadcast", v_diff_56, diff_56_scalar),
+            ("vbroadcast", v_three, three_const_s),
+        ]})
+
+        # Process in groups of 6 batches (5 groups of 6 + 1 group of 2) - 4-value arithmetic lookup
+        # Register assignments for 6-batch node lookup:
+        #   offset/bit0/group1/diff_groups/node_val → offset_regs
+        #   bit1 → bit1_regs (= tmp6 first elements)
+        #   group0 → group0_regs (= tmp6 second elements)
+        offset_regs = [v_node_A, v_node_B, v_r_odd, v_r_even, v_bit0_C, v_bit0_D]
+        bit1_regs = [v_tmp1_A, v_tmp1_B, v_tmp1_E, v_tmp1_C, v_tmp1_D, v_tmp1_F]
+        group0_regs = [v_tmp2_A, v_tmp2_B, v_tmp2_E, v_tmp2_C, v_tmp2_D, v_tmp2_F]
+        tmp6 = [(v_tmp1_A, v_tmp2_A), (v_tmp1_B, v_tmp2_B), (v_tmp1_E, v_tmp2_E),
+                (v_tmp1_C, v_tmp2_C), (v_tmp1_D, v_tmp2_D), (v_tmp1_F, v_tmp2_F)]
+        mult_consts = [v_mult_4097, None, v_mult_33, None, v_mult_9, None]
+
+        for group in range(6):
+            if group < 5:
+                b = group * 6
+                vals = [v_val[b + i] for i in range(6)]
+                idxs = [v_idx[b + i] for i in range(6)]
+                n = 6
+            else:
+                b = 30
+                vals = [v_val[b], v_val[b + 1]]
+                idxs = [v_idx[b], v_idx[b + 1]]
+                n = 2
+
+            # Step 1: offset = idx - 3
+            self.add_bundle({"valu": [("-", offset_regs[i], idxs[i], v_three) for i in range(n)]})
+
+            # Step 2: bit0 = offset & 1 (overwrites offset), bit1 = offset >> 1
+            if n > 3:
                 self.add_bundle({"valu": [
-                    ("multiply_add", val_A, val_A, mult_consts[hi], vc1),
-                    ("multiply_add", val_B, val_B, mult_consts[hi], vc1),
+                    op for i in range(3) for op in [
+                        ("&", offset_regs[i], offset_regs[i], v_one),
+                        (">>", bit1_regs[i], offset_regs[i], v_one),
+                    ]
+                ]})
+                self.add_bundle({"valu": [
+                    op for i in range(3, n) for op in [
+                        ("&", offset_regs[i], offset_regs[i], v_one),
+                        (">>", bit1_regs[i], offset_regs[i], v_one),
+                    ]
                 ]})
             else:
                 self.add_bundle({"valu": [
-                    (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
-                    (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
+                    op for i in range(n) for op in [
+                        ("&", offset_regs[i], offset_regs[i], v_one),
+                        (">>", bit1_regs[i], offset_regs[i], v_one),
+                    ]
                 ]})
-                self.add_bundle({"valu": [(op2, val_A, v_tmp1_A, v_tmp2_A), (op2, val_B, v_tmp1_B, v_tmp2_B)]})
 
-        # Save prev values
-        prev_val_A, prev_val_B = val_A, val_B
-        prev_idx_A, prev_idx_B = idx_A, idx_B
-
-        # Pairs 1-15: overlapped - vselect for current with hash finish for previous
-        for b in range(2, num_batches, 2):
-            val_A, val_B = v_val[b], v_val[b + 1]
-            idx_A, idx_B = v_idx[b], v_idx[b + 1]
-
-            # Bits for current + hash stage 4 for previous
-            vc1_4, vc2_4 = v_hash_consts[4]
-            op1_4, _, op2_4, op3_4, _ = HASH_STAGES[4]
+            # Step 3a: group0 = bit0 * diff_34 + f3
             self.add_bundle({"valu": [
-                ("&", v_bit0_C, idx_A, v_one), (">>", v_bit1_C, idx_A, v_one),
-                (op1_4, v_tmp1_A, prev_val_A, vc1_4), (op3_4, v_tmp2_A, prev_val_A, vc2_4),
+                ("multiply_add", group0_regs[i], offset_regs[i], v_diff_34, v_f3) for i in range(n)
             ]})
+            # Step 3b: group1 = bit0 * diff_56 + f5 (overwrites bit0 in offset_regs, VLIW safe)
             self.add_bundle({"valu": [
-                ("&", v_bit0_D, idx_B, v_one), (">>", v_bit1_D, idx_B, v_one),
-                (op2_4, prev_val_A, v_tmp1_A, v_tmp2_A),
-                (op1_4, v_tmp1_B, prev_val_B, vc1_4), (op3_4, v_tmp2_B, prev_val_B, vc2_4),
+                ("multiply_add", offset_regs[i], offset_regs[i], v_diff_56, v_f5) for i in range(n)
             ]})
-            # Mask + hash stage 5 for prev
-            vc1_5, vc2_5 = v_hash_consts[5]
-            op1_5, _, op2_5, op3_5, _ = HASH_STAGES[5]
+            # Step 4: diff_groups = group1 - group0
+            self.add_bundle({"valu": [("-", offset_regs[i], offset_regs[i], group0_regs[i]) for i in range(n)]})
+            # Step 5: node_val = bit1 * diff_groups + group0
             self.add_bundle({"valu": [
-                ("&", v_bit1_C, v_bit1_C, v_one), ("&", v_bit1_D, v_bit1_D, v_one),
-                (op2_4, prev_val_B, v_tmp1_B, v_tmp2_B),
-            ]})
-            # vselect A odd + hash stage 5 for prev
-            self.add_bundle({
-                "flow": [("vselect", v_r_odd, v_bit1_C, v_f3, v_f5)],
-                "valu": [(op1_5, v_tmp1_A, prev_val_A, vc1_5), (op3_5, v_tmp2_A, prev_val_A, vc2_5)],
-            })
-            # vselect A even + hash finish for prev A
-            self.add_bundle({
-                "flow": [("vselect", v_r_even, v_bit1_C, v_f6, v_f4)],
-                "valu": [(op2_5, prev_val_A, v_tmp1_A, v_tmp2_A)],
-            })
-            # vselect A final + hash 5 for prev B
-            self.add_bundle({
-                "flow": [("vselect", v_node_A, v_bit0_C, v_r_odd, v_r_even)],
-                "valu": [(op1_5, v_tmp1_B, prev_val_B, vc1_5), (op3_5, v_tmp2_B, prev_val_B, vc2_5)],
-            })
-            # vselect B odd + hash finish for prev B
-            self.add_bundle({
-                "flow": [("vselect", v_r_odd, v_bit1_D, v_f3, v_f5)],
-                "valu": [(op2_5, prev_val_B, v_tmp1_B, v_tmp2_B)],
-            })
-            # vselect B even + idx for prev A
-            self.add_bundle({
-                "flow": [("vselect", v_r_even, v_bit1_D, v_f6, v_f4)],
-                "valu": [("&", v_tmp1_A, prev_val_A, v_one), ("<<", prev_idx_A, prev_idx_A, v_one)],
-            })
-            # vselect B final + idx for prev
-            self.add_bundle({
-                "flow": [("vselect", v_node_B, v_bit0_D, v_r_odd, v_r_even)],
-                "valu": [
-                    ("+", v_tmp1_A, v_tmp1_A, v_one),
-                    ("&", v_tmp1_B, prev_val_B, v_one), ("<<", prev_idx_B, prev_idx_B, v_one),
-                ],
-            })
-            # Finish prev idx + XOR current
-            self.add_bundle({"valu": [
-                ("+", prev_idx_A, prev_idx_A, v_tmp1_A),
-                ("+", v_tmp1_B, v_tmp1_B, v_one),
-            ]})
-            self.add_bundle({"valu": [
-                ("+", prev_idx_B, prev_idx_B, v_tmp1_B),
-                ("^", val_A, val_A, v_node_A), ("^", val_B, val_B, v_node_B),
+                ("multiply_add", offset_regs[i], bit1_regs[i], offset_regs[i], group0_regs[i]) for i in range(n)
             ]})
 
-            # Hash stages 0-3 with multiply_add for stages 0, 2
-            mult_consts = [v_mult_4097, None, v_mult_33, None]
-            for hi in range(4):
+            # XOR val with node_val
+            self.add_bundle({"valu": [("^", vals[i], vals[i], offset_regs[i]) for i in range(n)]})
+
+            # Hash stages 0-5
+            for hi in range(6):
                 vc1, vc2 = v_hash_consts[hi]
                 op1, _, op2, op3, _ = HASH_STAGES[hi]
-                if hi in [0, 2]:
+                if hi in [0, 2, 4]:
                     self.add_bundle({"valu": [
-                        ("multiply_add", val_A, val_A, mult_consts[hi], vc1),
-                        ("multiply_add", val_B, val_B, mult_consts[hi], vc1),
+                        ("multiply_add", vals[i], vals[i], mult_consts[hi], vc1) for i in range(n)
                     ]})
                 else:
-                    self.add_bundle({"valu": [
-                        (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
-                        (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
-                    ]})
-                    self.add_bundle({"valu": [(op2, val_A, v_tmp1_A, v_tmp2_A), (op2, val_B, v_tmp1_B, v_tmp2_B)]})
+                    if n > 3:
+                        self.add_bundle({"valu": [
+                            op for i in range(3) for op in [
+                                (op1, tmp6[i][0], vals[i], vc1), (op3, tmp6[i][1], vals[i], vc2),
+                            ]
+                        ]})
+                        self.add_bundle({"valu": [
+                            op for i in range(3, n) for op in [
+                                (op1, tmp6[i][0], vals[i], vc1), (op3, tmp6[i][1], vals[i], vc2),
+                            ]
+                        ]})
+                    else:
+                        self.add_bundle({"valu": [
+                            op for i in range(n) for op in [
+                                (op1, tmp6[i][0], vals[i], vc1), (op3, tmp6[i][1], vals[i], vc2),
+                            ]
+                        ]})
+                    self.add_bundle({"valu": [(op2, vals[i], tmp6[i][0], tmp6[i][1]) for i in range(n)]})
 
-            prev_val_A, prev_val_B = val_A, val_B
-            prev_idx_A, prev_idx_B = idx_A, idx_B
-
-        # Finish last pair (hash 4-5 + idx)
-        vc1_4, vc2_4 = v_hash_consts[4]
-        op1_4, _, op2_4, op3_4, _ = HASH_STAGES[4]
-        vc1_5, vc2_5 = v_hash_consts[5]
-        op1_5, _, op2_5, op3_5, _ = HASH_STAGES[5]
-        self.add_bundle({"valu": [
-            (op1_4, v_tmp1_A, prev_val_A, vc1_4), (op3_4, v_tmp2_A, prev_val_A, vc2_4),
-            (op1_4, v_tmp1_B, prev_val_B, vc1_4), (op3_4, v_tmp2_B, prev_val_B, vc2_4),
-        ]})
-        self.add_bundle({"valu": [(op2_4, prev_val_A, v_tmp1_A, v_tmp2_A), (op2_4, prev_val_B, v_tmp1_B, v_tmp2_B)]})
-        self.add_bundle({"valu": [
-            (op1_5, v_tmp1_A, prev_val_A, vc1_5), (op3_5, v_tmp2_A, prev_val_A, vc2_5),
-            (op1_5, v_tmp1_B, prev_val_B, vc1_5), (op3_5, v_tmp2_B, prev_val_B, vc2_5),
-        ]})
-        self.add_bundle({"valu": [(op2_5, prev_val_A, v_tmp1_A, v_tmp2_A), (op2_5, prev_val_B, v_tmp1_B, v_tmp2_B)]})
-        self.add_bundle({"valu": [
-            ("&", v_tmp1_A, prev_val_A, v_one), ("<<", prev_idx_A, prev_idx_A, v_one),
-            ("&", v_tmp1_B, prev_val_B, v_one), ("<<", prev_idx_B, prev_idx_B, v_one),
-        ]})
-        self.add_bundle({"valu": [("+", v_tmp1_A, v_tmp1_A, v_one), ("+", v_tmp1_B, v_tmp1_B, v_one)]})
-        self.add_bundle({"valu": [("+", prev_idx_A, prev_idx_A, v_tmp1_A), ("+", prev_idx_B, prev_idx_B, v_tmp1_B)]})
+            # idx = 2*idx + (val&1 + 1) (3 cycles)
+            self.add_bundle({"valu": [("&", tmp6[i][0], vals[i], v_one) for i in range(n)]})
+            self.add_bundle({"valu": [("+", tmp6[i][0], tmp6[i][0], v_one) for i in range(n)]})
+            self.add_bundle({"valu": [("multiply_add", idxs[i], idxs[i], v_two, tmp6[i][0]) for i in range(n)]})
 
         # ===== MAIN LOOP (rounds 3-9) - PIPELINED with overlapped loads =====
         # Key insight: Phase 5 has ~19 cycles with NO loads. During those cycles,
         # we can pre-load the next group's nodes (32 loads = 16 cycles at 2 loads/cycle).
 
-        self.add_bundle({"load": [("const", round_counter, 3)]})
-        round_loop_start = len(self.instrs)
-
-        # Extra temps for 4-batch processing
-        v_tmp1_D = self.alloc_scratch("v_tmp1_D", VLEN)
-        v_tmp2_D = self.alloc_scratch("v_tmp2_D", VLEN)
+        # 4-batch tmp list for main loop (D already allocated above)
         tmp_list = [(v_tmp1_A, v_tmp2_A), (v_tmp1_B, v_tmp2_B), (v_tmp1_C, v_tmp2_C), (v_tmp1_D, v_tmp2_D)]
 
         # Allocate two sets of node storage for double buffering
@@ -655,15 +599,26 @@ class KernelBuilder:
         vc1_5, vc2_5 = v_hash_consts[5]
         op1_5, _, op2_5, op3_5, _ = HASH_STAGES[5]
 
-        # ===== GROUP 0: Full gather (no pre-loaded nodes available) =====
+        self.add_bundle({"load": [("const", round_counter, 3)]})
+
+        # Preload round 3 group 0 batch 0 (seed cross-round pipeline)
+        self.add_bundle({
+            "alu": [("+", addr_A[i], self.scratch["forest_values_p"], v_idx[0] + i) for i in range(VLEN)],
+        })
+        for i in range(VLEN // 2):
+            self.add_bundle({
+                "load": [
+                    ("load", node_set_A[0] + 2 * i, addr_A[2 * i]),
+                    ("load", node_set_A[0] + 2 * i + 1, addr_A[2 * i + 1]),
+                ]
+            })
+
+        round_loop_start = len(self.instrs)
+
+        # ===== GROUP 0: Batch 0 preloaded, gather batch 1-3 =====
         base = 0
         batch_info = [(v_idx[base + i], v_val[base + i]) for i in range(4)]
         nodes = node_set_A  # Use set A for group 0
-
-        # Phase 1: Gather batch 0
-        self.add_bundle({"alu": [("+", addr_A[i], self.scratch["forest_values_p"], batch_info[0][0] + i) for i in range(VLEN)]})
-        for i in range(0, VLEN, 2):
-            self.add_bundle({"load": [("load", nodes[0] + i, addr_A[i]), ("load", nodes[0] + i + 1, addr_A[i + 1])]})
 
         # Phase 2: Gather batch 1 + XOR batch 0 + start hash 0
         self.add_bundle({"alu": [("+", addr_A[i], self.scratch["forest_values_p"], batch_info[1][0] + i) for i in range(VLEN)]})
@@ -885,8 +840,9 @@ class KernelBuilder:
         })
         self.add_bundle({"load": [("load", next_nodes[3] + 6, addr_A[6]), ("load", next_nodes[3] + 7, addr_A[7])]})
 
-        # ===== GROUPS 1-6: Use pre-loaded nodes + pre-load next group =====
-        # Optimized: compute addresses for 2 batches at once using addr_A and addr_B
+        # ===== GROUPS 1-6: multiply_add hash + overlapped next-group loading =====
+        # Uses multiply_add for hash stages 0,2,4 → compute fits entirely within load phase
+        fp = self.scratch["forest_values_p"]
         for group in range(1, 7):
             base = group * 4
             batch_info = [(v_idx[base + i], v_val[base + i]) for i in range(4)]
@@ -896,305 +852,237 @@ class KernelBuilder:
             next_base = (group + 1) * 4
             next_batch_info = [(v_idx[next_base + i], v_val[next_base + i]) for i in range(4)]
 
-            # Compute addresses for next batches 0,1 + XOR current batches
+            # C1: addr_A(next_b0) + XOR(0-3)
             self.add_bundle({
-                "alu": [("+", addr_A[i], self.scratch["forest_values_p"], next_batch_info[0][0] + i) for i in range(VLEN)],
-                "valu": [
-                    ("^", batch_info[0][1], batch_info[0][1], nodes[0]),
-                    ("^", batch_info[1][1], batch_info[1][1], nodes[1]),
-                    ("^", batch_info[2][1], batch_info[2][1], nodes[2]),
-                    ("^", batch_info[3][1], batch_info[3][1], nodes[3]),
-                ],
+                "alu": [("+", addr_A[i], fp, next_batch_info[0][0] + i) for i in range(VLEN)],
+                "valu": [("^", batch_info[j][1], batch_info[j][1], nodes[j]) for j in range(4)],
             })
+            # C2: addr_B(next_b1) + multiply_add stage 0 (0-3)
             self.add_bundle({
-                "alu": [("+", addr_B[i], self.scratch["forest_values_p"], next_batch_info[1][0] + i) for i in range(VLEN)],
-                "valu": [
-                    (op1_0, tmp_list[0][0], batch_info[0][1], vc1_0), (op3_0, tmp_list[0][1], batch_info[0][1], vc2_0),
-                    (op1_0, tmp_list[1][0], batch_info[1][1], vc1_0), (op3_0, tmp_list[1][1], batch_info[1][1], vc2_0),
-                ],
+                "alu": [("+", addr_B[i], fp, next_batch_info[1][0] + i) for i in range(VLEN)],
+                "valu": [("multiply_add", batch_info[j][1], batch_info[j][1], v_mult_4097, vc1_0) for j in range(4)],
             })
-            # Load batches 0,1 interleaved (8 cycles for 16 loads)
+            # C3: load(n0[0],n1[0]) + stage 1 step1 (0-2) [6 VALU]
             self.add_bundle({
                 "load": [("load", next_nodes[0] + 0, addr_A[0]), ("load", next_nodes[1] + 0, addr_B[0])],
                 "valu": [
-                    (op2_0, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
-                    (op2_0, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
-                    (op1_0, tmp_list[2][0], batch_info[2][1], vc1_0), (op3_0, tmp_list[2][1], batch_info[2][1], vc2_0),
-                ],
-            })
-            self.add_bundle({
-                "load": [("load", next_nodes[0] + 1, addr_A[1]), ("load", next_nodes[1] + 1, addr_B[1])],
-                "valu": [
                     (op1_1, tmp_list[0][0], batch_info[0][1], vc1_1), (op3_1, tmp_list[0][1], batch_info[0][1], vc2_1),
                     (op1_1, tmp_list[1][0], batch_info[1][1], vc1_1), (op3_1, tmp_list[1][1], batch_info[1][1], vc2_1),
-                ],
-            })
-            self.add_bundle({
-                "load": [("load", next_nodes[0] + 2, addr_A[2]), ("load", next_nodes[1] + 2, addr_B[2])],
-                "valu": [
-                    (op2_1, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
-                    (op2_1, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
-                    (op2_0, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
-                    (op1_0, tmp_list[3][0], batch_info[3][1], vc1_0), (op3_0, tmp_list[3][1], batch_info[3][1], vc2_0),
-                ],
-            })
-            self.add_bundle({
-                "load": [("load", next_nodes[0] + 3, addr_A[3]), ("load", next_nodes[1] + 3, addr_B[3])],
-                "valu": [
-                    (op1_2, tmp_list[0][0], batch_info[0][1], vc1_2), (op3_2, tmp_list[0][1], batch_info[0][1], vc2_2),
-                    (op1_2, tmp_list[1][0], batch_info[1][1], vc1_2), (op3_2, tmp_list[1][1], batch_info[1][1], vc2_2),
-                ],
-            })
-            self.add_bundle({
-                "load": [("load", next_nodes[0] + 4, addr_A[4]), ("load", next_nodes[1] + 4, addr_B[4])],
-                "valu": [
-                    (op2_2, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
-                    (op2_2, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
                     (op1_1, tmp_list[2][0], batch_info[2][1], vc1_1), (op3_1, tmp_list[2][1], batch_info[2][1], vc2_1),
                 ],
             })
+            # C4: load(n0[1],n1[1]) + stage 1 step1 (3) [2 VALU]
             self.add_bundle({
-                "load": [("load", next_nodes[0] + 5, addr_A[5]), ("load", next_nodes[1] + 5, addr_B[5])],
+                "load": [("load", next_nodes[0] + 1, addr_A[1]), ("load", next_nodes[1] + 1, addr_B[1])],
                 "valu": [
-                    (op1_3, tmp_list[0][0], batch_info[0][1], vc1_3), (op3_3, tmp_list[0][1], batch_info[0][1], vc2_3),
-                    (op1_3, tmp_list[1][0], batch_info[1][1], vc1_3), (op3_3, tmp_list[1][1], batch_info[1][1], vc2_3),
-                ],
-            })
-            self.add_bundle({
-                "load": [("load", next_nodes[0] + 6, addr_A[6]), ("load", next_nodes[1] + 6, addr_B[6])],
-                "valu": [
-                    (op2_3, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
-                    (op2_3, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
-                    (op2_1, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
-                    (op2_0, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
-                ],
-            })
-            self.add_bundle({
-                "load": [("load", next_nodes[0] + 7, addr_A[7]), ("load", next_nodes[1] + 7, addr_B[7])],
-                "valu": [
-                    (op1_4, tmp_list[0][0], batch_info[0][1], vc1_4), (op3_4, tmp_list[0][1], batch_info[0][1], vc2_4),
-                    (op1_4, tmp_list[1][0], batch_info[1][1], vc1_4), (op3_4, tmp_list[1][1], batch_info[1][1], vc2_4),
-                ],
-            })
-            # Compute addresses for next batches 2,3
-            self.add_bundle({
-                "alu": [("+", addr_A[i], self.scratch["forest_values_p"], next_batch_info[2][0] + i) for i in range(VLEN)],
-                "valu": [
-                    (op2_4, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
-                    (op2_4, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
-                    (op1_2, tmp_list[2][0], batch_info[2][1], vc1_2), (op3_2, tmp_list[2][1], batch_info[2][1], vc2_2),
-                ],
-            })
-            self.add_bundle({
-                "alu": [("+", addr_B[i], self.scratch["forest_values_p"], next_batch_info[3][0] + i) for i in range(VLEN)],
-                "valu": [
-                    (op1_5, tmp_list[0][0], batch_info[0][1], vc1_5), (op3_5, tmp_list[0][1], batch_info[0][1], vc2_5),
-                    (op1_5, tmp_list[1][0], batch_info[1][1], vc1_5), (op3_5, tmp_list[1][1], batch_info[1][1], vc2_5),
-                ],
-            })
-            # Load batches 2,3 interleaved
-            self.add_bundle({
-                "load": [("load", next_nodes[2] + 0, addr_A[0]), ("load", next_nodes[3] + 0, addr_B[0])],
-                "valu": [
-                    (op2_5, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
-                    (op2_5, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
-                    (op2_2, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
                     (op1_1, tmp_list[3][0], batch_info[3][1], vc1_1), (op3_1, tmp_list[3][1], batch_info[3][1], vc2_1),
                 ],
             })
+            # C5: load(n0[2],n1[2]) + stage 1 step2 (0-3) [4 VALU]
+            self.add_bundle({
+                "load": [("load", next_nodes[0] + 2, addr_A[2]), ("load", next_nodes[1] + 2, addr_B[2])],
+                "valu": [(op2_1, batch_info[j][1], tmp_list[j][0], tmp_list[j][1]) for j in range(4)],
+            })
+            # C6: load(n0[3],n1[3]) + multiply_add stage 2 (0-3) [4 VALU]
+            self.add_bundle({
+                "load": [("load", next_nodes[0] + 3, addr_A[3]), ("load", next_nodes[1] + 3, addr_B[3])],
+                "valu": [("multiply_add", batch_info[j][1], batch_info[j][1], v_mult_33, vc1_2) for j in range(4)],
+            })
+            # C7: load(n0[4],n1[4]) + stage 3 step1 (0-2) [6 VALU]
+            self.add_bundle({
+                "load": [("load", next_nodes[0] + 4, addr_A[4]), ("load", next_nodes[1] + 4, addr_B[4])],
+                "valu": [
+                    (op1_3, tmp_list[0][0], batch_info[0][1], vc1_3), (op3_3, tmp_list[0][1], batch_info[0][1], vc2_3),
+                    (op1_3, tmp_list[1][0], batch_info[1][1], vc1_3), (op3_3, tmp_list[1][1], batch_info[1][1], vc2_3),
+                    (op1_3, tmp_list[2][0], batch_info[2][1], vc1_3), (op3_3, tmp_list[2][1], batch_info[2][1], vc2_3),
+                ],
+            })
+            # C8: load(n0[5],n1[5]) + stage 3 step1 (3) [2 VALU]
+            self.add_bundle({
+                "load": [("load", next_nodes[0] + 5, addr_A[5]), ("load", next_nodes[1] + 5, addr_B[5])],
+                "valu": [
+                    (op1_3, tmp_list[3][0], batch_info[3][1], vc1_3), (op3_3, tmp_list[3][1], batch_info[3][1], vc2_3),
+                ],
+            })
+            # C9: load(n0[6],n1[6]) + stage 3 step2 (0-3) [4 VALU]
+            self.add_bundle({
+                "load": [("load", next_nodes[0] + 6, addr_A[6]), ("load", next_nodes[1] + 6, addr_B[6])],
+                "valu": [(op2_3, batch_info[j][1], tmp_list[j][0], tmp_list[j][1]) for j in range(4)],
+            })
+            # C10: load(n0[7],n1[7]) + multiply_add stage 4 (0-3) [4 VALU]
+            self.add_bundle({
+                "load": [("load", next_nodes[0] + 7, addr_A[7]), ("load", next_nodes[1] + 7, addr_B[7])],
+                "valu": [("multiply_add", batch_info[j][1], batch_info[j][1], v_mult_9, vc1_4) for j in range(4)],
+            })
+            # C11: addr_A(next_b2) + stage 5 step1 (0-2) [6 VALU]
+            self.add_bundle({
+                "alu": [("+", addr_A[i], fp, next_batch_info[2][0] + i) for i in range(VLEN)],
+                "valu": [
+                    (op1_5, tmp_list[0][0], batch_info[0][1], vc1_5), (op3_5, tmp_list[0][1], batch_info[0][1], vc2_5),
+                    (op1_5, tmp_list[1][0], batch_info[1][1], vc1_5), (op3_5, tmp_list[1][1], batch_info[1][1], vc2_5),
+                    (op1_5, tmp_list[2][0], batch_info[2][1], vc1_5), (op3_5, tmp_list[2][1], batch_info[2][1], vc2_5),
+                ],
+            })
+            # C12: addr_B(next_b3) + stage 5 step1 (3) [2 VALU]
+            self.add_bundle({
+                "alu": [("+", addr_B[i], fp, next_batch_info[3][0] + i) for i in range(VLEN)],
+                "valu": [
+                    (op1_5, tmp_list[3][0], batch_info[3][1], vc1_5), (op3_5, tmp_list[3][1], batch_info[3][1], vc2_5),
+                ],
+            })
+            # C13: load(n2[0],n3[0]) + stage 5 step2 (0-3) [4 VALU]
+            self.add_bundle({
+                "load": [("load", next_nodes[2] + 0, addr_A[0]), ("load", next_nodes[3] + 0, addr_B[0])],
+                "valu": [(op2_5, batch_info[j][1], tmp_list[j][0], tmp_list[j][1]) for j in range(4)],
+            })
+            # C14: load(n2[1],n3[1]) + idx &+<< (0-2) [6 VALU]
             self.add_bundle({
                 "load": [("load", next_nodes[2] + 1, addr_A[1]), ("load", next_nodes[3] + 1, addr_B[1])],
                 "valu": [
                     ("&", tmp_list[0][0], batch_info[0][1], v_one), ("<<", batch_info[0][0], batch_info[0][0], v_one),
                     ("&", tmp_list[1][0], batch_info[1][1], v_one), ("<<", batch_info[1][0], batch_info[1][0], v_one),
+                    ("&", tmp_list[2][0], batch_info[2][1], v_one), ("<<", batch_info[2][0], batch_info[2][0], v_one),
                 ],
             })
+            # C15: load(n2[2],n3[2]) + idx &+<<(3) + idx +(bit)(0-2) [5 VALU]
             self.add_bundle({
                 "load": [("load", next_nodes[2] + 2, addr_A[2]), ("load", next_nodes[3] + 2, addr_B[2])],
                 "valu": [
+                    ("&", tmp_list[3][0], batch_info[3][1], v_one), ("<<", batch_info[3][0], batch_info[3][0], v_one),
                     ("+", tmp_list[0][0], tmp_list[0][0], v_one),
                     ("+", tmp_list[1][0], tmp_list[1][0], v_one),
-                    (op1_3, tmp_list[2][0], batch_info[2][1], vc1_3), (op3_3, tmp_list[2][1], batch_info[2][1], vc2_3),
+                    ("+", tmp_list[2][0], tmp_list[2][0], v_one),
                 ],
             })
+            # C16: load(n2[3],n3[3]) + idx +(bit)(3) + idx +(idx)(0-2) [4 VALU]
             self.add_bundle({
                 "load": [("load", next_nodes[2] + 3, addr_A[3]), ("load", next_nodes[3] + 3, addr_B[3])],
                 "valu": [
+                    ("+", tmp_list[3][0], tmp_list[3][0], v_one),
                     ("+", batch_info[0][0], batch_info[0][0], tmp_list[0][0]),
                     ("+", batch_info[1][0], batch_info[1][0], tmp_list[1][0]),
-                    (op2_3, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
-                    (op2_1, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
+                    ("+", batch_info[2][0], batch_info[2][0], tmp_list[2][0]),
                 ],
             })
+            # C17: load(n2[4],n3[4]) + idx +(idx)(3) [1 VALU]
             self.add_bundle({
                 "load": [("load", next_nodes[2] + 4, addr_A[4]), ("load", next_nodes[3] + 4, addr_B[4])],
-                "valu": [
-                    (op1_4, tmp_list[2][0], batch_info[2][1], vc1_4), (op3_4, tmp_list[2][1], batch_info[2][1], vc2_4),
-                    (op1_2, tmp_list[3][0], batch_info[3][1], vc1_2), (op3_2, tmp_list[3][1], batch_info[3][1], vc2_2),
-                ],
+                "valu": [("+", batch_info[3][0], batch_info[3][0], tmp_list[3][0])],
             })
-            self.add_bundle({
-                "load": [("load", next_nodes[2] + 5, addr_A[5]), ("load", next_nodes[3] + 5, addr_B[5])],
-                "valu": [
-                    (op2_4, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
-                    (op2_2, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
-                ],
-            })
-            self.add_bundle({
-                "load": [("load", next_nodes[2] + 6, addr_A[6]), ("load", next_nodes[3] + 6, addr_B[6])],
-                "valu": [
-                    (op1_5, tmp_list[2][0], batch_info[2][1], vc1_5), (op3_5, tmp_list[2][1], batch_info[2][1], vc2_5),
-                    (op1_3, tmp_list[3][0], batch_info[3][1], vc1_3), (op3_3, tmp_list[3][1], batch_info[3][1], vc2_3),
-                ],
-            })
-            self.add_bundle({
-                "load": [("load", next_nodes[2] + 7, addr_A[7]), ("load", next_nodes[3] + 7, addr_B[7])],
-                "valu": [
-                    (op2_5, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
-                    (op2_3, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
-                ],
-            })
-            # Finish idx for batches 2,3 (fixed data dependencies)
-            self.add_bundle({"valu": [
-                ("&", tmp_list[2][0], batch_info[2][1], v_one), ("<<", batch_info[2][0], batch_info[2][0], v_one),
-                (op1_4, tmp_list[3][0], batch_info[3][1], vc1_4), (op3_4, tmp_list[3][1], batch_info[3][1], vc2_4),
-            ]})
-            self.add_bundle({"valu": [
-                ("+", tmp_list[2][0], tmp_list[2][0], v_one),
-                (op2_4, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
-            ]})
-            self.add_bundle({"valu": [
-                ("+", batch_info[2][0], batch_info[2][0], tmp_list[2][0]),
-                (op1_5, tmp_list[3][0], batch_info[3][1], vc1_5), (op3_5, tmp_list[3][1], batch_info[3][1], vc2_5),
-            ]})
-            self.add_bundle({"valu": [(op2_5, batch_info[3][1], tmp_list[3][0], tmp_list[3][1])]})
-            self.add_bundle({"valu": [("&", tmp_list[3][0], batch_info[3][1], v_one), ("<<", batch_info[3][0], batch_info[3][0], v_one)]})
-            self.add_bundle({"valu": [("+", tmp_list[3][0], tmp_list[3][0], v_one)]})
-            self.add_bundle({"valu": [("+", batch_info[3][0], batch_info[3][0], tmp_list[3][0])]})
+            # C18-20: remaining loads (no VALU needed)
+            self.add_bundle({"load": [("load", next_nodes[2] + 5, addr_A[5]), ("load", next_nodes[3] + 5, addr_B[5])]})
+            self.add_bundle({"load": [("load", next_nodes[2] + 6, addr_A[6]), ("load", next_nodes[3] + 6, addr_B[6])]})
+            self.add_bundle({"load": [("load", next_nodes[2] + 7, addr_A[7]), ("load", next_nodes[3] + 7, addr_B[7])]})
 
-        # ===== GROUP 7: Use pre-loaded nodes, no next group to load =====
+        # ===== GROUP 7: multiply_add hash + preload next round group 0 =====
         base = 7 * 4
         batch_info = [(v_idx[base + i], v_val[base + i]) for i in range(4)]
         nodes = node_set_B  # Group 7 (odd) uses set B
 
-        # XOR all 4 batches
-        self.add_bundle({"valu": [
-            ("^", batch_info[0][1], batch_info[0][1], nodes[0]),
-            ("^", batch_info[1][1], batch_info[1][1], nodes[1]),
-            ("^", batch_info[2][1], batch_info[2][1], nodes[2]),
-            ("^", batch_info[3][1], batch_info[3][1], nodes[3]),
-        ]})
-        # Hash all 4 batches - stage 0
-        self.add_bundle({"valu": [
-            (op1_0, tmp_list[0][0], batch_info[0][1], vc1_0), (op3_0, tmp_list[0][1], batch_info[0][1], vc2_0),
-            (op1_0, tmp_list[1][0], batch_info[1][1], vc1_0), (op3_0, tmp_list[1][1], batch_info[1][1], vc2_0),
-        ]})
-        self.add_bundle({"valu": [
-            (op2_0, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
-            (op2_0, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
-            (op1_0, tmp_list[2][0], batch_info[2][1], vc1_0), (op3_0, tmp_list[2][1], batch_info[2][1], vc2_0),
-        ]})
-        self.add_bundle({"valu": [
-            (op1_1, tmp_list[0][0], batch_info[0][1], vc1_1), (op3_1, tmp_list[0][1], batch_info[0][1], vc2_1),
-            (op1_1, tmp_list[1][0], batch_info[1][1], vc1_1), (op3_1, tmp_list[1][1], batch_info[1][1], vc2_1),
-        ]})
-        self.add_bundle({"valu": [
-            (op2_1, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
-            (op2_1, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
-            (op2_0, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
-            (op1_0, tmp_list[3][0], batch_info[3][1], vc1_0), (op3_0, tmp_list[3][1], batch_info[3][1], vc2_0),
-        ]})
-        self.add_bundle({"valu": [
-            (op1_2, tmp_list[0][0], batch_info[0][1], vc1_2), (op3_2, tmp_list[0][1], batch_info[0][1], vc2_2),
-            (op1_2, tmp_list[1][0], batch_info[1][1], vc1_2), (op3_2, tmp_list[1][1], batch_info[1][1], vc2_2),
-        ]})
-        self.add_bundle({"valu": [
-            (op2_2, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
-            (op2_2, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
-            (op1_1, tmp_list[2][0], batch_info[2][1], vc1_1), (op3_1, tmp_list[2][1], batch_info[2][1], vc2_1),
-        ]})
-        self.add_bundle({"valu": [
-            (op1_3, tmp_list[0][0], batch_info[0][1], vc1_3), (op3_3, tmp_list[0][1], batch_info[0][1], vc2_3),
-            (op1_3, tmp_list[1][0], batch_info[1][1], vc1_3), (op3_3, tmp_list[1][1], batch_info[1][1], vc2_3),
-        ]})
-        self.add_bundle({"valu": [
-            (op2_3, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
-            (op2_3, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
-            (op2_1, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
-            (op2_0, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
-        ]})
-        self.add_bundle({"valu": [
-            (op1_4, tmp_list[0][0], batch_info[0][1], vc1_4), (op3_4, tmp_list[0][1], batch_info[0][1], vc2_4),
-            (op1_4, tmp_list[1][0], batch_info[1][1], vc1_4), (op3_4, tmp_list[1][1], batch_info[1][1], vc2_4),
-        ]})
-        self.add_bundle({"valu": [
-            (op2_4, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
-            (op2_4, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
-            (op1_2, tmp_list[2][0], batch_info[2][1], vc1_2), (op3_2, tmp_list[2][1], batch_info[2][1], vc2_2),
-        ]})
+        # C1: XOR(0-3) + addr_A(next round batch 0)
+        self.add_bundle({
+            "alu": [("+", addr_A[i], fp, v_idx[0] + i) for i in range(VLEN)],
+            "valu": [("^", batch_info[j][1], batch_info[j][1], nodes[j]) for j in range(4)],
+        })
+        # C2: multiply_add stage 0(0-3) + addr_B(next round batch 1)
+        self.add_bundle({
+            "alu": [("+", addr_B[i], fp, v_idx[1] + i) for i in range(VLEN)],
+            "valu": [("multiply_add", batch_info[j][1], batch_info[j][1], v_mult_4097, vc1_0) for j in range(4)],
+        })
+        # C3: load(n0[0],n1[0]) + stage 1 step1(0-2)
+        self.add_bundle({
+            "load": [("load", node_set_A[0] + 0, addr_A[0]), ("load", node_set_A[1] + 0, addr_B[0])],
+            "valu": [
+                (op1_1, tmp_list[0][0], batch_info[0][1], vc1_1), (op3_1, tmp_list[0][1], batch_info[0][1], vc2_1),
+                (op1_1, tmp_list[1][0], batch_info[1][1], vc1_1), (op3_1, tmp_list[1][1], batch_info[1][1], vc2_1),
+                (op1_1, tmp_list[2][0], batch_info[2][1], vc1_1), (op3_1, tmp_list[2][1], batch_info[2][1], vc2_1),
+            ],
+        })
+        # C4: load(n0[1],n1[1]) + stage 1 step1(3)
+        self.add_bundle({
+            "load": [("load", node_set_A[0] + 1, addr_A[1]), ("load", node_set_A[1] + 1, addr_B[1])],
+            "valu": [
+                (op1_1, tmp_list[3][0], batch_info[3][1], vc1_1), (op3_1, tmp_list[3][1], batch_info[3][1], vc2_1),
+            ],
+        })
+        # C5: load(n0[2],n1[2]) + stage 1 step2(0-3)
+        self.add_bundle({
+            "load": [("load", node_set_A[0] + 2, addr_A[2]), ("load", node_set_A[1] + 2, addr_B[2])],
+            "valu": [(op2_1, batch_info[j][1], tmp_list[j][0], tmp_list[j][1]) for j in range(4)],
+        })
+        # C6: load(n0[3],n1[3]) + multiply_add stage 2(0-3)
+        self.add_bundle({
+            "load": [("load", node_set_A[0] + 3, addr_A[3]), ("load", node_set_A[1] + 3, addr_B[3])],
+            "valu": [("multiply_add", batch_info[j][1], batch_info[j][1], v_mult_33, vc1_2) for j in range(4)],
+        })
+        # C7: load(n0[4],n1[4]) + stage 3 step1(0-2)
+        self.add_bundle({
+            "load": [("load", node_set_A[0] + 4, addr_A[4]), ("load", node_set_A[1] + 4, addr_B[4])],
+            "valu": [
+                (op1_3, tmp_list[0][0], batch_info[0][1], vc1_3), (op3_3, tmp_list[0][1], batch_info[0][1], vc2_3),
+                (op1_3, tmp_list[1][0], batch_info[1][1], vc1_3), (op3_3, tmp_list[1][1], batch_info[1][1], vc2_3),
+                (op1_3, tmp_list[2][0], batch_info[2][1], vc1_3), (op3_3, tmp_list[2][1], batch_info[2][1], vc2_3),
+            ],
+        })
+        # C8: load(n0[5],n1[5]) + stage 3 step1(3)
+        self.add_bundle({
+            "load": [("load", node_set_A[0] + 5, addr_A[5]), ("load", node_set_A[1] + 5, addr_B[5])],
+            "valu": [
+                (op1_3, tmp_list[3][0], batch_info[3][1], vc1_3), (op3_3, tmp_list[3][1], batch_info[3][1], vc2_3),
+            ],
+        })
+        # C9: load(n0[6],n1[6]) + stage 3 step2(0-3)
+        self.add_bundle({
+            "load": [("load", node_set_A[0] + 6, addr_A[6]), ("load", node_set_A[1] + 6, addr_B[6])],
+            "valu": [(op2_3, batch_info[j][1], tmp_list[j][0], tmp_list[j][1]) for j in range(4)],
+        })
+        # C10: load(n0[7],n1[7]) + multiply_add stage 4(0-3)
+        self.add_bundle({
+            "load": [("load", node_set_A[0] + 7, addr_A[7]), ("load", node_set_A[1] + 7, addr_B[7])],
+            "valu": [("multiply_add", batch_info[j][1], batch_info[j][1], v_mult_9, vc1_4) for j in range(4)],
+        })
+        # C11: stage 5 step1(0-2) [VALU-only]
         self.add_bundle({"valu": [
             (op1_5, tmp_list[0][0], batch_info[0][1], vc1_5), (op3_5, tmp_list[0][1], batch_info[0][1], vc2_5),
             (op1_5, tmp_list[1][0], batch_info[1][1], vc1_5), (op3_5, tmp_list[1][1], batch_info[1][1], vc2_5),
+            (op1_5, tmp_list[2][0], batch_info[2][1], vc1_5), (op3_5, tmp_list[2][1], batch_info[2][1], vc2_5),
         ]})
+        # C12: stage 5 step1(3)
         self.add_bundle({"valu": [
-            (op2_5, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
-            (op2_5, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
-            (op2_2, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
-            (op1_1, tmp_list[3][0], batch_info[3][1], vc1_1), (op3_1, tmp_list[3][1], batch_info[3][1], vc2_1),
+            (op1_5, tmp_list[3][0], batch_info[3][1], vc1_5), (op3_5, tmp_list[3][1], batch_info[3][1], vc2_5),
         ]})
-        # Finish hash for batches 2,3 and compute idx for all
+        # C13: stage 5 step2(0-3)
+        self.add_bundle({"valu": [(op2_5, batch_info[j][1], tmp_list[j][0], tmp_list[j][1]) for j in range(4)]})
+        # C14: idx &+<<(0-2)
         self.add_bundle({"valu": [
             ("&", tmp_list[0][0], batch_info[0][1], v_one), ("<<", batch_info[0][0], batch_info[0][0], v_one),
             ("&", tmp_list[1][0], batch_info[1][1], v_one), ("<<", batch_info[1][0], batch_info[1][0], v_one),
+            ("&", tmp_list[2][0], batch_info[2][1], v_one), ("<<", batch_info[2][0], batch_info[2][0], v_one),
         ]})
+        # C15: idx &+<<(3) + +(bit)(0-2)
         self.add_bundle({"valu": [
+            ("&", tmp_list[3][0], batch_info[3][1], v_one), ("<<", batch_info[3][0], batch_info[3][0], v_one),
             ("+", tmp_list[0][0], tmp_list[0][0], v_one),
             ("+", tmp_list[1][0], tmp_list[1][0], v_one),
-            (op1_3, tmp_list[2][0], batch_info[2][1], vc1_3), (op3_3, tmp_list[2][1], batch_info[2][1], vc2_3),
-        ]})
-        self.add_bundle({"valu": [
-            ("+", batch_info[0][0], batch_info[0][0], tmp_list[0][0]),
-            ("+", batch_info[1][0], batch_info[1][0], tmp_list[1][0]),
-            (op2_3, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
-            (op2_1, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
-        ]})
-        self.add_bundle({"valu": [
-            (op1_4, tmp_list[2][0], batch_info[2][1], vc1_4), (op3_4, tmp_list[2][1], batch_info[2][1], vc2_4),
-            (op1_2, tmp_list[3][0], batch_info[3][1], vc1_2), (op3_2, tmp_list[3][1], batch_info[3][1], vc2_2),
-        ]})
-        self.add_bundle({"valu": [
-            (op2_4, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
-            (op2_2, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
-        ]})
-        self.add_bundle({"valu": [
-            (op1_5, tmp_list[2][0], batch_info[2][1], vc1_5), (op3_5, tmp_list[2][1], batch_info[2][1], vc2_5),
-            (op1_3, tmp_list[3][0], batch_info[3][1], vc1_3), (op3_3, tmp_list[3][1], batch_info[3][1], vc2_3),
-        ]})
-        self.add_bundle({"valu": [
-            (op2_5, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
-            (op2_3, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
-        ]})
-        self.add_bundle({"valu": [
-            ("&", tmp_list[2][0], batch_info[2][1], v_one), ("<<", batch_info[2][0], batch_info[2][0], v_one),
-            (op1_4, tmp_list[3][0], batch_info[3][1], vc1_4), (op3_4, tmp_list[3][1], batch_info[3][1], vc2_4),
-        ]})
-        self.add_bundle({"valu": [
             ("+", tmp_list[2][0], tmp_list[2][0], v_one),
-            (op2_4, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
         ]})
-        self.add_bundle({"valu": [
-            ("+", batch_info[2][0], batch_info[2][0], tmp_list[2][0]),
-            (op1_5, tmp_list[3][0], batch_info[3][1], vc1_5), (op3_5, tmp_list[3][1], batch_info[3][1], vc2_5),
-        ]})
-        self.add_bundle({"valu": [(op2_5, batch_info[3][1], tmp_list[3][0], tmp_list[3][1])]})
-        self.add_bundle({"valu": [("&", tmp_list[3][0], batch_info[3][1], v_one), ("<<", batch_info[3][0], batch_info[3][0], v_one)]})
-        self.add_bundle({"valu": [("+", tmp_list[3][0], tmp_list[3][0], v_one)]})
-        self.add_bundle({"valu": [("+", batch_info[3][0], batch_info[3][0], tmp_list[3][0])]})
+        # C16: +(bit)(3) + +(idx)(0-2) + round counter
+        self.add_bundle({
+            "valu": [
+                ("+", tmp_list[3][0], tmp_list[3][0], v_one),
+                ("+", batch_info[0][0], batch_info[0][0], tmp_list[0][0]),
+                ("+", batch_info[1][0], batch_info[1][0], tmp_list[1][0]),
+                ("+", batch_info[2][0], batch_info[2][0], tmp_list[2][0]),
+            ],
+            "flow": [("add_imm", round_counter, round_counter, 1)],
+        })
+        # C17: +(idx)(3) + round comparison
+        self.add_bundle({
+            "valu": [("+", batch_info[3][0], batch_info[3][0], tmp_list[3][0])],
+            "alu": [("<", tmp1, round_counter, ten_const)],
+        })
 
         # Round loop control - loop for rounds 3-9 only (7 iterations, no bounds check)
-        self.add_bundle({"flow": [("add_imm", round_counter, round_counter, 1)]})
-        ten_const = self.scratch_const(10)
-        self.add_bundle({"alu": [("<", tmp1, round_counter, ten_const)]})
         round_loop_offset = round_loop_start - len(self.instrs) - 1
         self.add_bundle({"flow": [("cond_jump_rel", tmp1, round_loop_offset)]})
 
@@ -1254,11 +1142,9 @@ class KernelBuilder:
         self.add_bundle({"load": [("load", next_nodes[3] + 6, addr_A[6]), ("load", next_nodes[3] + 7, addr_A[7])]})
 
         # Bounds check for group 0 (all indices wrap to 0 after this)
+        # Use multiply instead of vselect: idx * (idx < n_nodes) = idx if in bounds, 0 if out
         self.add_bundle({"valu": [("<", tmp_list[0][0], batch_info[0][0], v_n_nodes), ("<", tmp_list[1][0], batch_info[1][0], v_n_nodes), ("<", tmp_list[2][0], batch_info[2][0], v_n_nodes), ("<", tmp_list[3][0], batch_info[3][0], v_n_nodes)]})
-        self.add_bundle({"flow": [("vselect", batch_info[0][0], tmp_list[0][0], batch_info[0][0], v_zero)]})
-        self.add_bundle({"flow": [("vselect", batch_info[1][0], tmp_list[1][0], batch_info[1][0], v_zero)]})
-        self.add_bundle({"flow": [("vselect", batch_info[2][0], tmp_list[2][0], batch_info[2][0], v_zero)]})
-        self.add_bundle({"flow": [("vselect", batch_info[3][0], tmp_list[3][0], batch_info[3][0], v_zero)]})
+        self.add_bundle({"valu": [("*", batch_info[0][0], batch_info[0][0], tmp_list[0][0]), ("*", batch_info[1][0], batch_info[1][0], tmp_list[1][0]), ("*", batch_info[2][0], batch_info[2][0], tmp_list[2][0]), ("*", batch_info[3][0], batch_info[3][0], tmp_list[3][0])]})
 
         # Groups 1-6: Use pre-loaded nodes + pre-load next + bounds check
         for group in range(1, 7):
@@ -1269,340 +1155,313 @@ class KernelBuilder:
             next_base = (group + 1) * 4
             next_batch_info = [(v_idx[next_base + i], v_val[next_base + i]) for i in range(4)]
 
-            self.add_bundle({"alu": [("+", addr_A[i], self.scratch["forest_values_p"], next_batch_info[0][0] + i) for i in range(VLEN)], "valu": [("^", batch_info[0][1], batch_info[0][1], nodes[0]), ("^", batch_info[1][1], batch_info[1][1], nodes[1]), ("^", batch_info[2][1], batch_info[2][1], nodes[2]), ("^", batch_info[3][1], batch_info[3][1], nodes[3])]})
-            self.add_bundle({"alu": [("+", addr_B[i], self.scratch["forest_values_p"], next_batch_info[1][0] + i) for i in range(VLEN)], "valu": [(op1_0, tmp_list[0][0], batch_info[0][1], vc1_0), (op3_0, tmp_list[0][1], batch_info[0][1], vc2_0), (op1_0, tmp_list[1][0], batch_info[1][1], vc1_0), (op3_0, tmp_list[1][1], batch_info[1][1], vc2_0)]})
-            self.add_bundle({"load": [("load", next_nodes[0] + 0, addr_A[0]), ("load", next_nodes[1] + 0, addr_B[0])], "valu": [(op2_0, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]), (op2_0, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]), (op1_0, tmp_list[2][0], batch_info[2][1], vc1_0), (op3_0, tmp_list[2][1], batch_info[2][1], vc2_0)]})
-            self.add_bundle({"load": [("load", next_nodes[0] + 1, addr_A[1]), ("load", next_nodes[1] + 1, addr_B[1])], "valu": [(op1_1, tmp_list[0][0], batch_info[0][1], vc1_1), (op3_1, tmp_list[0][1], batch_info[0][1], vc2_1), (op1_1, tmp_list[1][0], batch_info[1][1], vc1_1), (op3_1, tmp_list[1][1], batch_info[1][1], vc2_1)]})
-            self.add_bundle({"load": [("load", next_nodes[0] + 2, addr_A[2]), ("load", next_nodes[1] + 2, addr_B[2])], "valu": [(op2_1, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]), (op2_1, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]), (op2_0, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]), (op1_0, tmp_list[3][0], batch_info[3][1], vc1_0), (op3_0, tmp_list[3][1], batch_info[3][1], vc2_0)]})
-            self.add_bundle({"load": [("load", next_nodes[0] + 3, addr_A[3]), ("load", next_nodes[1] + 3, addr_B[3])], "valu": [(op1_2, tmp_list[0][0], batch_info[0][1], vc1_2), (op3_2, tmp_list[0][1], batch_info[0][1], vc2_2), (op1_2, tmp_list[1][0], batch_info[1][1], vc1_2), (op3_2, tmp_list[1][1], batch_info[1][1], vc2_2)]})
-            self.add_bundle({"load": [("load", next_nodes[0] + 4, addr_A[4]), ("load", next_nodes[1] + 4, addr_B[4])], "valu": [(op2_2, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]), (op2_2, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]), (op1_1, tmp_list[2][0], batch_info[2][1], vc1_1), (op3_1, tmp_list[2][1], batch_info[2][1], vc2_1)]})
-            self.add_bundle({"load": [("load", next_nodes[0] + 5, addr_A[5]), ("load", next_nodes[1] + 5, addr_B[5])], "valu": [(op1_3, tmp_list[0][0], batch_info[0][1], vc1_3), (op3_3, tmp_list[0][1], batch_info[0][1], vc2_3), (op1_3, tmp_list[1][0], batch_info[1][1], vc1_3), (op3_3, tmp_list[1][1], batch_info[1][1], vc2_3)]})
-            self.add_bundle({"load": [("load", next_nodes[0] + 6, addr_A[6]), ("load", next_nodes[1] + 6, addr_B[6])], "valu": [(op2_3, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]), (op2_3, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]), (op2_1, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]), (op2_0, batch_info[3][1], tmp_list[3][0], tmp_list[3][1])]})
-            self.add_bundle({"load": [("load", next_nodes[0] + 7, addr_A[7]), ("load", next_nodes[1] + 7, addr_B[7])], "valu": [(op1_4, tmp_list[0][0], batch_info[0][1], vc1_4), (op3_4, tmp_list[0][1], batch_info[0][1], vc2_4), (op1_4, tmp_list[1][0], batch_info[1][1], vc1_4), (op3_4, tmp_list[1][1], batch_info[1][1], vc2_4)]})
-            self.add_bundle({"alu": [("+", addr_A[i], self.scratch["forest_values_p"], next_batch_info[2][0] + i) for i in range(VLEN)], "valu": [(op2_4, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]), (op2_4, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]), (op1_2, tmp_list[2][0], batch_info[2][1], vc1_2), (op3_2, tmp_list[2][1], batch_info[2][1], vc2_2)]})
-            self.add_bundle({"alu": [("+", addr_B[i], self.scratch["forest_values_p"], next_batch_info[3][0] + i) for i in range(VLEN)], "valu": [(op1_5, tmp_list[0][0], batch_info[0][1], vc1_5), (op3_5, tmp_list[0][1], batch_info[0][1], vc2_5), (op1_5, tmp_list[1][0], batch_info[1][1], vc1_5), (op3_5, tmp_list[1][1], batch_info[1][1], vc2_5)]})
-            self.add_bundle({"load": [("load", next_nodes[2] + 0, addr_A[0]), ("load", next_nodes[3] + 0, addr_B[0])], "valu": [(op2_5, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]), (op2_5, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]), (op2_2, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]), (op1_1, tmp_list[3][0], batch_info[3][1], vc1_1), (op3_1, tmp_list[3][1], batch_info[3][1], vc2_1)]})
-            self.add_bundle({"load": [("load", next_nodes[2] + 1, addr_A[1]), ("load", next_nodes[3] + 1, addr_B[1])], "valu": [("&", tmp_list[0][0], batch_info[0][1], v_one), ("<<", batch_info[0][0], batch_info[0][0], v_one), ("&", tmp_list[1][0], batch_info[1][1], v_one), ("<<", batch_info[1][0], batch_info[1][0], v_one)]})
-            self.add_bundle({"load": [("load", next_nodes[2] + 2, addr_A[2]), ("load", next_nodes[3] + 2, addr_B[2])], "valu": [("+", tmp_list[0][0], tmp_list[0][0], v_one), ("+", tmp_list[1][0], tmp_list[1][0], v_one), (op1_3, tmp_list[2][0], batch_info[2][1], vc1_3), (op3_3, tmp_list[2][1], batch_info[2][1], vc2_3)]})
-            self.add_bundle({"load": [("load", next_nodes[2] + 3, addr_A[3]), ("load", next_nodes[3] + 3, addr_B[3])], "valu": [("+", batch_info[0][0], batch_info[0][0], tmp_list[0][0]), ("+", batch_info[1][0], batch_info[1][0], tmp_list[1][0]), (op2_3, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]), (op2_1, batch_info[3][1], tmp_list[3][0], tmp_list[3][1])]})
-            self.add_bundle({"load": [("load", next_nodes[2] + 4, addr_A[4]), ("load", next_nodes[3] + 4, addr_B[4])], "valu": [(op1_4, tmp_list[2][0], batch_info[2][1], vc1_4), (op3_4, tmp_list[2][1], batch_info[2][1], vc2_4), (op1_2, tmp_list[3][0], batch_info[3][1], vc1_2), (op3_2, tmp_list[3][1], batch_info[3][1], vc2_2)]})
-            self.add_bundle({"load": [("load", next_nodes[2] + 5, addr_A[5]), ("load", next_nodes[3] + 5, addr_B[5])], "valu": [(op2_4, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]), (op2_2, batch_info[3][1], tmp_list[3][0], tmp_list[3][1])]})
-            self.add_bundle({"load": [("load", next_nodes[2] + 6, addr_A[6]), ("load", next_nodes[3] + 6, addr_B[6])], "valu": [(op1_5, tmp_list[2][0], batch_info[2][1], vc1_5), (op3_5, tmp_list[2][1], batch_info[2][1], vc2_5), (op1_3, tmp_list[3][0], batch_info[3][1], vc1_3), (op3_3, tmp_list[3][1], batch_info[3][1], vc2_3)]})
-            self.add_bundle({"load": [("load", next_nodes[2] + 7, addr_A[7]), ("load", next_nodes[3] + 7, addr_B[7])], "valu": [(op2_5, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]), (op2_3, batch_info[3][1], tmp_list[3][0], tmp_list[3][1])]})
-            self.add_bundle({"valu": [("&", tmp_list[2][0], batch_info[2][1], v_one), ("<<", batch_info[2][0], batch_info[2][0], v_one), (op1_4, tmp_list[3][0], batch_info[3][1], vc1_4), (op3_4, tmp_list[3][1], batch_info[3][1], vc2_4)]})
-            self.add_bundle({"valu": [("+", tmp_list[2][0], tmp_list[2][0], v_one), (op2_4, batch_info[3][1], tmp_list[3][0], tmp_list[3][1])]})
-            self.add_bundle({"valu": [("+", batch_info[2][0], batch_info[2][0], tmp_list[2][0]), (op1_5, tmp_list[3][0], batch_info[3][1], vc1_5), (op3_5, tmp_list[3][1], batch_info[3][1], vc2_5)]})
-            self.add_bundle({"valu": [(op2_5, batch_info[3][1], tmp_list[3][0], tmp_list[3][1])]})
-            self.add_bundle({"valu": [("&", tmp_list[3][0], batch_info[3][1], v_one), ("<<", batch_info[3][0], batch_info[3][0], v_one)]})
-            self.add_bundle({"valu": [("+", tmp_list[3][0], tmp_list[3][0], v_one)]})
-            self.add_bundle({"valu": [("+", batch_info[3][0], batch_info[3][0], tmp_list[3][0])]})
-            # Bounds check
-            self.add_bundle({"valu": [("<", tmp_list[0][0], batch_info[0][0], v_n_nodes), ("<", tmp_list[1][0], batch_info[1][0], v_n_nodes), ("<", tmp_list[2][0], batch_info[2][0], v_n_nodes), ("<", tmp_list[3][0], batch_info[3][0], v_n_nodes)]})
-            self.add_bundle({"flow": [("vselect", batch_info[0][0], tmp_list[0][0], batch_info[0][0], v_zero)]})
-            self.add_bundle({"flow": [("vselect", batch_info[1][0], tmp_list[1][0], batch_info[1][0], v_zero)]})
-            self.add_bundle({"flow": [("vselect", batch_info[2][0], tmp_list[2][0], batch_info[2][0], v_zero)]})
-            self.add_bundle({"flow": [("vselect", batch_info[3][0], tmp_list[3][0], batch_info[3][0], v_zero)]})
+            self.add_bundle({"alu": [("+", addr_A[i], fp, next_batch_info[0][0] + i) for i in range(VLEN)], "valu": [("^", batch_info[j][1], batch_info[j][1], nodes[j]) for j in range(4)]})
+            self.add_bundle({"alu": [("+", addr_B[i], fp, next_batch_info[1][0] + i) for i in range(VLEN)], "valu": [("multiply_add", batch_info[j][1], batch_info[j][1], v_mult_4097, vc1_0) for j in range(4)]})
+            self.add_bundle({"load": [("load", next_nodes[0] + 0, addr_A[0]), ("load", next_nodes[1] + 0, addr_B[0])], "valu": [(op1_1, tmp_list[0][0], batch_info[0][1], vc1_1), (op3_1, tmp_list[0][1], batch_info[0][1], vc2_1), (op1_1, tmp_list[1][0], batch_info[1][1], vc1_1), (op3_1, tmp_list[1][1], batch_info[1][1], vc2_1), (op1_1, tmp_list[2][0], batch_info[2][1], vc1_1), (op3_1, tmp_list[2][1], batch_info[2][1], vc2_1)]})
+            self.add_bundle({"load": [("load", next_nodes[0] + 1, addr_A[1]), ("load", next_nodes[1] + 1, addr_B[1])], "valu": [(op1_1, tmp_list[3][0], batch_info[3][1], vc1_1), (op3_1, tmp_list[3][1], batch_info[3][1], vc2_1)]})
+            self.add_bundle({"load": [("load", next_nodes[0] + 2, addr_A[2]), ("load", next_nodes[1] + 2, addr_B[2])], "valu": [(op2_1, batch_info[j][1], tmp_list[j][0], tmp_list[j][1]) for j in range(4)]})
+            self.add_bundle({"load": [("load", next_nodes[0] + 3, addr_A[3]), ("load", next_nodes[1] + 3, addr_B[3])], "valu": [("multiply_add", batch_info[j][1], batch_info[j][1], v_mult_33, vc1_2) for j in range(4)]})
+            self.add_bundle({"load": [("load", next_nodes[0] + 4, addr_A[4]), ("load", next_nodes[1] + 4, addr_B[4])], "valu": [(op1_3, tmp_list[0][0], batch_info[0][1], vc1_3), (op3_3, tmp_list[0][1], batch_info[0][1], vc2_3), (op1_3, tmp_list[1][0], batch_info[1][1], vc1_3), (op3_3, tmp_list[1][1], batch_info[1][1], vc2_3), (op1_3, tmp_list[2][0], batch_info[2][1], vc1_3), (op3_3, tmp_list[2][1], batch_info[2][1], vc2_3)]})
+            self.add_bundle({"load": [("load", next_nodes[0] + 5, addr_A[5]), ("load", next_nodes[1] + 5, addr_B[5])], "valu": [(op1_3, tmp_list[3][0], batch_info[3][1], vc1_3), (op3_3, tmp_list[3][1], batch_info[3][1], vc2_3)]})
+            self.add_bundle({"load": [("load", next_nodes[0] + 6, addr_A[6]), ("load", next_nodes[1] + 6, addr_B[6])], "valu": [(op2_3, batch_info[j][1], tmp_list[j][0], tmp_list[j][1]) for j in range(4)]})
+            self.add_bundle({"load": [("load", next_nodes[0] + 7, addr_A[7]), ("load", next_nodes[1] + 7, addr_B[7])], "valu": [("multiply_add", batch_info[j][1], batch_info[j][1], v_mult_9, vc1_4) for j in range(4)]})
+            self.add_bundle({"alu": [("+", addr_A[i], fp, next_batch_info[2][0] + i) for i in range(VLEN)], "valu": [(op1_5, tmp_list[0][0], batch_info[0][1], vc1_5), (op3_5, tmp_list[0][1], batch_info[0][1], vc2_5), (op1_5, tmp_list[1][0], batch_info[1][1], vc1_5), (op3_5, tmp_list[1][1], batch_info[1][1], vc2_5), (op1_5, tmp_list[2][0], batch_info[2][1], vc1_5), (op3_5, tmp_list[2][1], batch_info[2][1], vc2_5)]})
+            self.add_bundle({"alu": [("+", addr_B[i], fp, next_batch_info[3][0] + i) for i in range(VLEN)], "valu": [(op1_5, tmp_list[3][0], batch_info[3][1], vc1_5), (op3_5, tmp_list[3][1], batch_info[3][1], vc2_5)]})
+            self.add_bundle({"load": [("load", next_nodes[2] + 0, addr_A[0]), ("load", next_nodes[3] + 0, addr_B[0])], "valu": [(op2_5, batch_info[j][1], tmp_list[j][0], tmp_list[j][1]) for j in range(4)]})
+            self.add_bundle({"load": [("load", next_nodes[2] + 1, addr_A[1]), ("load", next_nodes[3] + 1, addr_B[1])], "valu": [("&", tmp_list[0][0], batch_info[0][1], v_one), ("<<", batch_info[0][0], batch_info[0][0], v_one), ("&", tmp_list[1][0], batch_info[1][1], v_one), ("<<", batch_info[1][0], batch_info[1][0], v_one), ("&", tmp_list[2][0], batch_info[2][1], v_one), ("<<", batch_info[2][0], batch_info[2][0], v_one)]})
+            self.add_bundle({"load": [("load", next_nodes[2] + 2, addr_A[2]), ("load", next_nodes[3] + 2, addr_B[2])], "valu": [("&", tmp_list[3][0], batch_info[3][1], v_one), ("<<", batch_info[3][0], batch_info[3][0], v_one), ("+", tmp_list[0][0], tmp_list[0][0], v_one), ("+", tmp_list[1][0], tmp_list[1][0], v_one), ("+", tmp_list[2][0], tmp_list[2][0], v_one)]})
+            self.add_bundle({"load": [("load", next_nodes[2] + 3, addr_A[3]), ("load", next_nodes[3] + 3, addr_B[3])], "valu": [("+", tmp_list[3][0], tmp_list[3][0], v_one), ("+", batch_info[0][0], batch_info[0][0], tmp_list[0][0]), ("+", batch_info[1][0], batch_info[1][0], tmp_list[1][0]), ("+", batch_info[2][0], batch_info[2][0], tmp_list[2][0])]})
+            self.add_bundle({"load": [("load", next_nodes[2] + 4, addr_A[4]), ("load", next_nodes[3] + 4, addr_B[4])], "valu": [("+", batch_info[3][0], batch_info[3][0], tmp_list[3][0])]})
+            self.add_bundle({"load": [("load", next_nodes[2] + 5, addr_A[5]), ("load", next_nodes[3] + 5, addr_B[5])], "valu": [("<", tmp_list[0][0], batch_info[0][0], v_n_nodes), ("<", tmp_list[1][0], batch_info[1][0], v_n_nodes), ("<", tmp_list[2][0], batch_info[2][0], v_n_nodes), ("<", tmp_list[3][0], batch_info[3][0], v_n_nodes)]})
+            self.add_bundle({"load": [("load", next_nodes[2] + 6, addr_A[6]), ("load", next_nodes[3] + 6, addr_B[6])], "valu": [("*", batch_info[0][0], batch_info[0][0], tmp_list[0][0]), ("*", batch_info[1][0], batch_info[1][0], tmp_list[1][0]), ("*", batch_info[2][0], batch_info[2][0], tmp_list[2][0]), ("*", batch_info[3][0], batch_info[3][0], tmp_list[3][0])]})
+            self.add_bundle({"load": [("load", next_nodes[2] + 7, addr_A[7]), ("load", next_nodes[3] + 7, addr_B[7])]})
 
-        # Group 7: Use pre-loaded nodes, no next group
+        # Group 7: multiply_add hash, no next group + bounds check
         base = 7 * 4
         batch_info = [(v_idx[base + i], v_val[base + i]) for i in range(4)]
         nodes = node_set_B
 
-        self.add_bundle({"valu": [("^", batch_info[0][1], batch_info[0][1], nodes[0]), ("^", batch_info[1][1], batch_info[1][1], nodes[1]), ("^", batch_info[2][1], batch_info[2][1], nodes[2]), ("^", batch_info[3][1], batch_info[3][1], nodes[3])]})
-        self.add_bundle({"valu": [(op1_0, tmp_list[0][0], batch_info[0][1], vc1_0), (op3_0, tmp_list[0][1], batch_info[0][1], vc2_0), (op1_0, tmp_list[1][0], batch_info[1][1], vc1_0), (op3_0, tmp_list[1][1], batch_info[1][1], vc2_0)]})
-        self.add_bundle({"valu": [(op2_0, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]), (op2_0, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]), (op1_0, tmp_list[2][0], batch_info[2][1], vc1_0), (op3_0, tmp_list[2][1], batch_info[2][1], vc2_0)]})
-        self.add_bundle({"valu": [(op1_1, tmp_list[0][0], batch_info[0][1], vc1_1), (op3_1, tmp_list[0][1], batch_info[0][1], vc2_1), (op1_1, tmp_list[1][0], batch_info[1][1], vc1_1), (op3_1, tmp_list[1][1], batch_info[1][1], vc2_1)]})
-        self.add_bundle({"valu": [(op2_1, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]), (op2_1, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]), (op2_0, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]), (op1_0, tmp_list[3][0], batch_info[3][1], vc1_0), (op3_0, tmp_list[3][1], batch_info[3][1], vc2_0)]})
-        self.add_bundle({"valu": [(op1_2, tmp_list[0][0], batch_info[0][1], vc1_2), (op3_2, tmp_list[0][1], batch_info[0][1], vc2_2), (op1_2, tmp_list[1][0], batch_info[1][1], vc1_2), (op3_2, tmp_list[1][1], batch_info[1][1], vc2_2)]})
-        self.add_bundle({"valu": [(op2_2, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]), (op2_2, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]), (op1_1, tmp_list[2][0], batch_info[2][1], vc1_1), (op3_1, tmp_list[2][1], batch_info[2][1], vc2_1)]})
-        self.add_bundle({"valu": [(op1_3, tmp_list[0][0], batch_info[0][1], vc1_3), (op3_3, tmp_list[0][1], batch_info[0][1], vc2_3), (op1_3, tmp_list[1][0], batch_info[1][1], vc1_3), (op3_3, tmp_list[1][1], batch_info[1][1], vc2_3)]})
-        self.add_bundle({"valu": [(op2_3, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]), (op2_3, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]), (op2_1, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]), (op2_0, batch_info[3][1], tmp_list[3][0], tmp_list[3][1])]})
-        self.add_bundle({"valu": [(op1_4, tmp_list[0][0], batch_info[0][1], vc1_4), (op3_4, tmp_list[0][1], batch_info[0][1], vc2_4), (op1_4, tmp_list[1][0], batch_info[1][1], vc1_4), (op3_4, tmp_list[1][1], batch_info[1][1], vc2_4)]})
-        self.add_bundle({"valu": [(op2_4, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]), (op2_4, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]), (op1_2, tmp_list[2][0], batch_info[2][1], vc1_2), (op3_2, tmp_list[2][1], batch_info[2][1], vc2_2)]})
-        self.add_bundle({"valu": [(op1_5, tmp_list[0][0], batch_info[0][1], vc1_5), (op3_5, tmp_list[0][1], batch_info[0][1], vc2_5), (op1_5, tmp_list[1][0], batch_info[1][1], vc1_5), (op3_5, tmp_list[1][1], batch_info[1][1], vc2_5)]})
-        self.add_bundle({"valu": [(op2_5, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]), (op2_5, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]), (op2_2, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]), (op1_1, tmp_list[3][0], batch_info[3][1], vc1_1), (op3_1, tmp_list[3][1], batch_info[3][1], vc2_1)]})
-        self.add_bundle({"valu": [("&", tmp_list[0][0], batch_info[0][1], v_one), ("<<", batch_info[0][0], batch_info[0][0], v_one), ("&", tmp_list[1][0], batch_info[1][1], v_one), ("<<", batch_info[1][0], batch_info[1][0], v_one)]})
-        self.add_bundle({"valu": [("+", tmp_list[0][0], tmp_list[0][0], v_one), ("+", tmp_list[1][0], tmp_list[1][0], v_one), (op1_3, tmp_list[2][0], batch_info[2][1], vc1_3), (op3_3, tmp_list[2][1], batch_info[2][1], vc2_3)]})
-        self.add_bundle({"valu": [("+", batch_info[0][0], batch_info[0][0], tmp_list[0][0]), ("+", batch_info[1][0], batch_info[1][0], tmp_list[1][0]), (op2_3, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]), (op2_1, batch_info[3][1], tmp_list[3][0], tmp_list[3][1])]})
-        self.add_bundle({"valu": [(op1_4, tmp_list[2][0], batch_info[2][1], vc1_4), (op3_4, tmp_list[2][1], batch_info[2][1], vc2_4), (op1_2, tmp_list[3][0], batch_info[3][1], vc1_2), (op3_2, tmp_list[3][1], batch_info[3][1], vc2_2)]})
-        self.add_bundle({"valu": [(op2_4, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]), (op2_2, batch_info[3][1], tmp_list[3][0], tmp_list[3][1])]})
-        self.add_bundle({"valu": [(op1_5, tmp_list[2][0], batch_info[2][1], vc1_5), (op3_5, tmp_list[2][1], batch_info[2][1], vc2_5), (op1_3, tmp_list[3][0], batch_info[3][1], vc1_3), (op3_3, tmp_list[3][1], batch_info[3][1], vc2_3)]})
-        self.add_bundle({"valu": [(op2_5, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]), (op2_3, batch_info[3][1], tmp_list[3][0], tmp_list[3][1])]})
-        self.add_bundle({"valu": [("&", tmp_list[2][0], batch_info[2][1], v_one), ("<<", batch_info[2][0], batch_info[2][0], v_one), (op1_4, tmp_list[3][0], batch_info[3][1], vc1_4), (op3_4, tmp_list[3][1], batch_info[3][1], vc2_4)]})
-        self.add_bundle({"valu": [("+", tmp_list[2][0], tmp_list[2][0], v_one), (op2_4, batch_info[3][1], tmp_list[3][0], tmp_list[3][1])]})
-        self.add_bundle({"valu": [("+", batch_info[2][0], batch_info[2][0], tmp_list[2][0]), (op1_5, tmp_list[3][0], batch_info[3][1], vc1_5), (op3_5, tmp_list[3][1], batch_info[3][1], vc2_5)]})
-        self.add_bundle({"valu": [(op2_5, batch_info[3][1], tmp_list[3][0], tmp_list[3][1])]})
-        self.add_bundle({"valu": [("&", tmp_list[3][0], batch_info[3][1], v_one), ("<<", batch_info[3][0], batch_info[3][0], v_one)]})
-        self.add_bundle({"valu": [("+", tmp_list[3][0], tmp_list[3][0], v_one)]})
+        # C1: XOR(0-3)
+        self.add_bundle({"valu": [("^", batch_info[j][1], batch_info[j][1], nodes[j]) for j in range(4)]})
+        # C2: multiply_add stage 0(0-3)
+        self.add_bundle({"valu": [("multiply_add", batch_info[j][1], batch_info[j][1], v_mult_4097, vc1_0) for j in range(4)]})
+        # C3: stage 1 step1(0-2)
+        self.add_bundle({"valu": [
+            (op1_1, tmp_list[0][0], batch_info[0][1], vc1_1), (op3_1, tmp_list[0][1], batch_info[0][1], vc2_1),
+            (op1_1, tmp_list[1][0], batch_info[1][1], vc1_1), (op3_1, tmp_list[1][1], batch_info[1][1], vc2_1),
+            (op1_1, tmp_list[2][0], batch_info[2][1], vc1_1), (op3_1, tmp_list[2][1], batch_info[2][1], vc2_1),
+        ]})
+        # C4: stage 1 step1(3)
+        self.add_bundle({"valu": [(op1_1, tmp_list[3][0], batch_info[3][1], vc1_1), (op3_1, tmp_list[3][1], batch_info[3][1], vc2_1)]})
+        # C5: stage 1 step2(0-3)
+        self.add_bundle({"valu": [(op2_1, batch_info[j][1], tmp_list[j][0], tmp_list[j][1]) for j in range(4)]})
+        # C6: multiply_add stage 2(0-3)
+        self.add_bundle({"valu": [("multiply_add", batch_info[j][1], batch_info[j][1], v_mult_33, vc1_2) for j in range(4)]})
+        # C7: stage 3 step1(0-2)
+        self.add_bundle({"valu": [
+            (op1_3, tmp_list[0][0], batch_info[0][1], vc1_3), (op3_3, tmp_list[0][1], batch_info[0][1], vc2_3),
+            (op1_3, tmp_list[1][0], batch_info[1][1], vc1_3), (op3_3, tmp_list[1][1], batch_info[1][1], vc2_3),
+            (op1_3, tmp_list[2][0], batch_info[2][1], vc1_3), (op3_3, tmp_list[2][1], batch_info[2][1], vc2_3),
+        ]})
+        # C8: stage 3 step1(3)
+        self.add_bundle({"valu": [(op1_3, tmp_list[3][0], batch_info[3][1], vc1_3), (op3_3, tmp_list[3][1], batch_info[3][1], vc2_3)]})
+        # C9: stage 3 step2(0-3)
+        self.add_bundle({"valu": [(op2_3, batch_info[j][1], tmp_list[j][0], tmp_list[j][1]) for j in range(4)]})
+        # C10: multiply_add stage 4(0-3)
+        self.add_bundle({"valu": [("multiply_add", batch_info[j][1], batch_info[j][1], v_mult_9, vc1_4) for j in range(4)]})
+        # C11: stage 5 step1(0-2)
+        self.add_bundle({"valu": [
+            (op1_5, tmp_list[0][0], batch_info[0][1], vc1_5), (op3_5, tmp_list[0][1], batch_info[0][1], vc2_5),
+            (op1_5, tmp_list[1][0], batch_info[1][1], vc1_5), (op3_5, tmp_list[1][1], batch_info[1][1], vc2_5),
+            (op1_5, tmp_list[2][0], batch_info[2][1], vc1_5), (op3_5, tmp_list[2][1], batch_info[2][1], vc2_5),
+        ]})
+        # C12: stage 5 step1(3)
+        self.add_bundle({"valu": [(op1_5, tmp_list[3][0], batch_info[3][1], vc1_5), (op3_5, tmp_list[3][1], batch_info[3][1], vc2_5)]})
+        # C13: stage 5 step2(0-3)
+        self.add_bundle({"valu": [(op2_5, batch_info[j][1], tmp_list[j][0], tmp_list[j][1]) for j in range(4)]})
+        # C14: idx &+<<(0-2)
+        self.add_bundle({"valu": [
+            ("&", tmp_list[0][0], batch_info[0][1], v_one), ("<<", batch_info[0][0], batch_info[0][0], v_one),
+            ("&", tmp_list[1][0], batch_info[1][1], v_one), ("<<", batch_info[1][0], batch_info[1][0], v_one),
+            ("&", tmp_list[2][0], batch_info[2][1], v_one), ("<<", batch_info[2][0], batch_info[2][0], v_one),
+        ]})
+        # C15: idx &+<<(3) + +(bit)(0-2)
+        self.add_bundle({"valu": [
+            ("&", tmp_list[3][0], batch_info[3][1], v_one), ("<<", batch_info[3][0], batch_info[3][0], v_one),
+            ("+", tmp_list[0][0], tmp_list[0][0], v_one),
+            ("+", tmp_list[1][0], tmp_list[1][0], v_one),
+            ("+", tmp_list[2][0], tmp_list[2][0], v_one),
+        ]})
+        # C16: +(bit)(3) + +(idx)(0-2)
+        self.add_bundle({"valu": [
+            ("+", tmp_list[3][0], tmp_list[3][0], v_one),
+            ("+", batch_info[0][0], batch_info[0][0], tmp_list[0][0]),
+            ("+", batch_info[1][0], batch_info[1][0], tmp_list[1][0]),
+            ("+", batch_info[2][0], batch_info[2][0], tmp_list[2][0]),
+        ]})
+        # C17: +(idx)(3)
         self.add_bundle({"valu": [("+", batch_info[3][0], batch_info[3][0], tmp_list[3][0])]})
-        # Bounds check
-        self.add_bundle({"valu": [("<", tmp_list[0][0], batch_info[0][0], v_n_nodes), ("<", tmp_list[1][0], batch_info[1][0], v_n_nodes), ("<", tmp_list[2][0], batch_info[2][0], v_n_nodes), ("<", tmp_list[3][0], batch_info[3][0], v_n_nodes)]})
-        self.add_bundle({"flow": [("vselect", batch_info[0][0], tmp_list[0][0], batch_info[0][0], v_zero)]})
-        self.add_bundle({"flow": [("vselect", batch_info[1][0], tmp_list[1][0], batch_info[1][0], v_zero)]})
-        self.add_bundle({"flow": [("vselect", batch_info[2][0], tmp_list[2][0], batch_info[2][0], v_zero)]})
-        self.add_bundle({"flow": [("vselect", batch_info[3][0], tmp_list[3][0], batch_info[3][0], v_zero)]})
+        # Bounds check: idx = idx * (idx < n_nodes)
+        self.add_bundle({"valu": [("<", tmp_list[j][0], batch_info[j][0], v_n_nodes) for j in range(4)]})
+        self.add_bundle({"valu": [("*", batch_info[j][0], batch_info[j][0], tmp_list[j][0]) for j in range(4)]})
 
         # ===== ROUNDS 11-15: Unrolled (mirror rounds 0-4 after wrapping) =====
         # After round 10, ALL indices wrap to 0!
 
-        # Round 11 (like round 0): all indices are 0 - process 3 batches at a time
+        # Round 11 (like round 0): all indices are 0 - 6-batch processing
         # OPTIMIZATION: Reuse v_node_shared from round 0 (forest[0] doesn't change)
-
-        for group in range(11):
-            if group < 10:
-                b = group * 3
-                val_A, val_B, val_C = v_val[b], v_val[b + 1], v_val[b + 2]
-                idx_A, idx_B, idx_C = v_idx[b], v_idx[b + 1], v_idx[b + 2]
-
-                self.add_bundle({"valu": [
-                    ("^", val_A, val_A, v_node_shared), ("^", val_B, val_B, v_node_shared),
-                    ("^", val_C, val_C, v_node_shared),
-                ]})
-
-                # Hash stages 0-5 with multiply_add for stages 0, 2, 4
-                mult_consts = [v_mult_4097, None, v_mult_33, None, v_mult_9, None]
-                for hi in range(6):
-                    vc1, vc2 = v_hash_consts[hi]
-                    op1, _, op2, op3, _ = HASH_STAGES[hi]
-                    if hi in [0, 2, 4]:
-                        self.add_bundle({"valu": [
-                            ("multiply_add", val_A, val_A, mult_consts[hi], vc1),
-                            ("multiply_add", val_B, val_B, mult_consts[hi], vc1),
-                            ("multiply_add", val_C, val_C, mult_consts[hi], vc1),
-                        ]})
-                    else:
-                        self.add_bundle({"valu": [
-                            (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
-                            (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
-                            (op1, v_tmp1_E, val_C, vc1), (op3, v_tmp2_E, val_C, vc2),
-                        ]})
-                        self.add_bundle({"valu": [
-                            (op2, val_A, v_tmp1_A, v_tmp2_A),
-                            (op2, val_B, v_tmp1_B, v_tmp2_B),
-                            (op2, val_C, v_tmp1_E, v_tmp2_E),
-                        ]})
-
-                self.add_bundle({"valu": [
-                    ("&", idx_A, val_A, v_one), ("&", idx_B, val_B, v_one), ("&", idx_C, val_C, v_one),
-                ]})
-                self.add_bundle({"valu": [
-                    ("+", idx_A, idx_A, v_one), ("+", idx_B, idx_B, v_one), ("+", idx_C, idx_C, v_one),
-                ]})
+        mult_consts = [v_mult_4097, None, v_mult_33, None, v_mult_9, None]
+        for group in range(6):
+            if group < 5:
+                b = group * 6
+                vals = [v_val[b + i] for i in range(6)]
+                idxs = [v_idx[b + i] for i in range(6)]
+                n = 6
             else:
                 b = 30
-                val_A, val_B = v_val[b], v_val[b + 1]
-                idx_A, idx_B = v_idx[b], v_idx[b + 1]
-                self.add_bundle({"valu": [("^", val_A, val_A, v_node_shared), ("^", val_B, val_B, v_node_shared)]})
-                mult_consts = [v_mult_4097, None, v_mult_33, None, v_mult_9, None]
-                for hi in range(6):
-                    vc1, vc2 = v_hash_consts[hi]
-                    op1, _, op2, op3, _ = HASH_STAGES[hi]
-                    if hi in [0, 2, 4]:
-                        self.add_bundle({"valu": [
-                            ("multiply_add", val_A, val_A, mult_consts[hi], vc1),
-                            ("multiply_add", val_B, val_B, mult_consts[hi], vc1),
-                        ]})
-                    else:
-                        self.add_bundle({"valu": [
-                            (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
-                            (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
-                        ]})
-                        self.add_bundle({"valu": [(op2, val_A, v_tmp1_A, v_tmp2_A), (op2, val_B, v_tmp1_B, v_tmp2_B)]})
-                self.add_bundle({"valu": [("&", idx_A, val_A, v_one), ("&", idx_B, val_B, v_one)]})
-                self.add_bundle({"valu": [("+", idx_A, idx_A, v_one), ("+", idx_B, idx_B, v_one)]})
+                vals = [v_val[b], v_val[b + 1]]
+                idxs = [v_idx[b], v_idx[b + 1]]
+                n = 2
 
-        # Round 12 (like round 1): indices in {1,2}
-        # OPTIMIZATION: Reuse v_node1, v_node2 from round 1 (forest[1,2] don't change)
+            # XOR with shared node
+            self.add_bundle({"valu": [("^", vals[i], vals[i], v_node_shared) for i in range(n)]})
 
-        for b in range(0, num_batches, 2):
-            val_A, val_B = v_val[b], v_val[b + 1]
-            idx_A, idx_B = v_idx[b], v_idx[b + 1]
-            # Select: idx==1 -> v_node1, idx==2 -> v_node2
-            self.add_bundle({"valu": [("==", v_tmp1_A, idx_A, v_one), ("==", v_tmp1_B, idx_B, v_one)]})
-            self.add_bundle({"flow": [("vselect", v_node_A, v_tmp1_A, v_node1, v_node2)]})
-            self.add_bundle({"flow": [("vselect", v_node_B, v_tmp1_B, v_node1, v_node2)]})
-            self.add_bundle({"valu": [("^", val_A, val_A, v_node_A), ("^", val_B, val_B, v_node_B)]})
-            # Hash with multiply_add for stages 0, 2, 4
-            mult_consts = [v_mult_4097, None, v_mult_33, None, v_mult_9, None]
+            # Hash stages 0-5
             for hi in range(6):
                 vc1, vc2 = v_hash_consts[hi]
                 op1, _, op2, op3, _ = HASH_STAGES[hi]
                 if hi in [0, 2, 4]:
                     self.add_bundle({"valu": [
-                        ("multiply_add", val_A, val_A, mult_consts[hi], vc1),
-                        ("multiply_add", val_B, val_B, mult_consts[hi], vc1),
+                        ("multiply_add", vals[i], vals[i], mult_consts[hi], vc1) for i in range(n)
                     ]})
                 else:
+                    if n > 3:
+                        # Split part 1 into 2 cycles (6 ops each)
+                        self.add_bundle({"valu": [
+                            op for i in range(3) for op in [
+                                (op1, tmp6[i][0], vals[i], vc1), (op3, tmp6[i][1], vals[i], vc2),
+                            ]
+                        ]})
+                        self.add_bundle({"valu": [
+                            op for i in range(3, n) for op in [
+                                (op1, tmp6[i][0], vals[i], vc1), (op3, tmp6[i][1], vals[i], vc2),
+                            ]
+                        ]})
+                    else:
+                        self.add_bundle({"valu": [
+                            op for i in range(n) for op in [
+                                (op1, tmp6[i][0], vals[i], vc1), (op3, tmp6[i][1], vals[i], vc2),
+                            ]
+                        ]})
+                    self.add_bundle({"valu": [(op2, vals[i], tmp6[i][0], tmp6[i][1]) for i in range(n)]})
+
+            # idx = (val & 1) + 1
+            self.add_bundle({"valu": [("&", idxs[i], vals[i], v_one) for i in range(n)]})
+            self.add_bundle({"valu": [("+", idxs[i], idxs[i], v_one) for i in range(n)]})
+
+        # Round 12 (like round 1): indices in {1,2} - 6-batch processing
+        # ARITHMETIC APPROACH: Reuse v_diff_12 and v_base2_12 from round 1 (forest doesn't change)
+        mult_consts = [v_mult_4097, None, v_mult_33, None, v_mult_9, None]
+        for group in range(6):
+            if group < 5:
+                b = group * 6
+                vals = [v_val[b + i] for i in range(6)]
+                idxs = [v_idx[b + i] for i in range(6)]
+                n = 6
+            else:
+                b = 30
+                vals = [v_val[b], v_val[b + 1]]
+                idxs = [v_idx[b], v_idx[b + 1]]
+                n = 2
+
+            # Node lookup: node = idx * diff + base2
+            nodes = [tmp6[i][0] for i in range(n)]
+            self.add_bundle({"valu": [("multiply_add", nodes[i], idxs[i], v_diff_12, v_base2_12) for i in range(n)]})
+
+            # XOR val with node
+            self.add_bundle({"valu": [("^", vals[i], vals[i], nodes[i]) for i in range(n)]})
+
+            # Hash stages 0-5
+            for hi in range(6):
+                vc1, vc2 = v_hash_consts[hi]
+                op1, _, op2, op3, _ = HASH_STAGES[hi]
+                if hi in [0, 2, 4]:
                     self.add_bundle({"valu": [
-                        (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
-                        (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
+                        ("multiply_add", vals[i], vals[i], mult_consts[hi], vc1) for i in range(n)
                     ]})
-                    self.add_bundle({"valu": [(op2, val_A, v_tmp1_A, v_tmp2_A), (op2, val_B, v_tmp1_B, v_tmp2_B)]})
-            # idx = 2*idx + 1 + (val&1) using multiply_add
-            self.add_bundle({"valu": [("&", v_tmp1_A, val_A, v_one), ("&", v_tmp1_B, val_B, v_one)]})
-            self.add_bundle({"valu": [
-                ("multiply_add", idx_A, idx_A, v_two, v_one),
-                ("multiply_add", idx_B, idx_B, v_two, v_one),
-            ]})
-            self.add_bundle({"valu": [("+", idx_A, idx_A, v_tmp1_A), ("+", idx_B, idx_B, v_tmp1_B)]})
-            # No bounds check needed - indices will be {3,4,5,6} < n_nodes
+                else:
+                    if n > 3:
+                        # Split part 1 into 2 cycles (6 ops each)
+                        self.add_bundle({"valu": [
+                            op for i in range(3) for op in [
+                                (op1, tmp6[i][0], vals[i], vc1), (op3, tmp6[i][1], vals[i], vc2),
+                            ]
+                        ]})
+                        self.add_bundle({"valu": [
+                            op for i in range(3, n) for op in [
+                                (op1, tmp6[i][0], vals[i], vc1), (op3, tmp6[i][1], vals[i], vc2),
+                            ]
+                        ]})
+                    else:
+                        self.add_bundle({"valu": [
+                            op for i in range(n) for op in [
+                                (op1, tmp6[i][0], vals[i], vc1), (op3, tmp6[i][1], vals[i], vc2),
+                            ]
+                        ]})
+                    self.add_bundle({"valu": [(op2, vals[i], tmp6[i][0], tmp6[i][1]) for i in range(n)]})
+
+            # idx = 2*idx + (val&1 + 1)
+            self.add_bundle({"valu": [("&", tmp6[i][0], vals[i], v_one) for i in range(n)]})
+            self.add_bundle({"valu": [("+", tmp6[i][0], tmp6[i][0], v_one) for i in range(n)]})
+            self.add_bundle({"valu": [("multiply_add", idxs[i], idxs[i], v_two, tmp6[i][0]) for i in range(n)]})
 
         # Round 13 (like round 2): indices in {3,4,5,6}
-        # OPTIMIZATION: Reuse v_f3, v_f4, v_f5, v_f6 from round 2 (forest[3..6] don't change)
+        # ARITHMETIC APPROACH: Reuse v_diff_34, v_diff_56, v_f3, v_f5, v_three from round 2
 
-        # Pair 0: full processing without overlap
-        val_A, val_B = v_val[0], v_val[1]
-        idx_A, idx_B = v_idx[0], v_idx[1]
+        # Process in groups of 6 batches (5 groups of 6 + 1 group of 2) - 4-value arithmetic lookup
+        offset_regs = [v_node_A, v_node_B, v_r_odd, v_r_even, v_bit0_C, v_bit0_D]
+        bit1_regs = [v_tmp1_A, v_tmp1_B, v_tmp1_E, v_tmp1_C, v_tmp1_D, v_tmp1_F]
+        group0_regs = [v_tmp2_A, v_tmp2_B, v_tmp2_E, v_tmp2_C, v_tmp2_D, v_tmp2_F]
+        tmp6 = [(v_tmp1_A, v_tmp2_A), (v_tmp1_B, v_tmp2_B), (v_tmp1_E, v_tmp2_E),
+                (v_tmp1_C, v_tmp2_C), (v_tmp1_D, v_tmp2_D), (v_tmp1_F, v_tmp2_F)]
+        mult_consts = [v_mult_4097, None, v_mult_33, None, v_mult_9, None]
 
-        self.add_bundle({"valu": [
-            ("&", v_tmp1_A, idx_A, v_one), (">>", v_tmp2_A, idx_A, v_one),
-            ("&", v_tmp1_B, idx_B, v_one), (">>", v_tmp2_B, idx_B, v_one),
-        ]})
-        self.add_bundle({"valu": [("&", v_tmp2_A, v_tmp2_A, v_one), ("&", v_tmp2_B, v_tmp2_B, v_one)]})
-        self.add_bundle({"flow": [("vselect", v_r_odd, v_tmp2_A, v_f3, v_f5)]})
-        self.add_bundle({"flow": [("vselect", v_r_even, v_tmp2_A, v_f6, v_f4)]})
-        self.add_bundle({"flow": [("vselect", v_node_A, v_tmp1_A, v_r_odd, v_r_even)]})
-        self.add_bundle({"flow": [("vselect", v_r_odd, v_tmp2_B, v_f3, v_f5)]})
-        self.add_bundle({"flow": [("vselect", v_r_even, v_tmp2_B, v_f6, v_f4)]})
-        self.add_bundle({"flow": [("vselect", v_node_B, v_tmp1_B, v_r_odd, v_r_even)]})
-        self.add_bundle({"valu": [("^", val_A, val_A, v_node_A), ("^", val_B, val_B, v_node_B)]})
+        for group in range(6):
+            if group < 5:
+                b = group * 6
+                vals = [v_val[b + i] for i in range(6)]
+                idxs = [v_idx[b + i] for i in range(6)]
+                n = 6
+            else:
+                b = 30
+                vals = [v_val[b], v_val[b + 1]]
+                idxs = [v_idx[b], v_idx[b + 1]]
+                n = 2
 
-        # Hash stages 0-3 with multiply_add for stages 0, 2
-        mult_consts = [v_mult_4097, None, v_mult_33, None]
-        for hi in range(4):
-            vc1, vc2 = v_hash_consts[hi]
-            op1, _, op2, op3, _ = HASH_STAGES[hi]
-            if hi in [0, 2]:
+            # Step 1: offset = idx - 3
+            self.add_bundle({"valu": [("-", offset_regs[i], idxs[i], v_three) for i in range(n)]})
+
+            # Step 2: bit0 = offset & 1 (overwrites offset), bit1 = offset >> 1
+            if n > 3:
                 self.add_bundle({"valu": [
-                    ("multiply_add", val_A, val_A, mult_consts[hi], vc1),
-                    ("multiply_add", val_B, val_B, mult_consts[hi], vc1),
+                    op for i in range(3) for op in [
+                        ("&", offset_regs[i], offset_regs[i], v_one),
+                        (">>", bit1_regs[i], offset_regs[i], v_one),
+                    ]
+                ]})
+                self.add_bundle({"valu": [
+                    op for i in range(3, n) for op in [
+                        ("&", offset_regs[i], offset_regs[i], v_one),
+                        (">>", bit1_regs[i], offset_regs[i], v_one),
+                    ]
                 ]})
             else:
                 self.add_bundle({"valu": [
-                    (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
-                    (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
+                    op for i in range(n) for op in [
+                        ("&", offset_regs[i], offset_regs[i], v_one),
+                        (">>", bit1_regs[i], offset_regs[i], v_one),
+                    ]
                 ]})
-                self.add_bundle({"valu": [(op2, val_A, v_tmp1_A, v_tmp2_A), (op2, val_B, v_tmp1_B, v_tmp2_B)]})
 
-        prev_val_A, prev_val_B = val_A, val_B
-        prev_idx_A, prev_idx_B = idx_A, idx_B
-
-        # Pairs 1-15: pipelined with vselect overlapping hash finish
-        for b in range(2, num_batches, 2):
-            val_A, val_B = v_val[b], v_val[b + 1]
-            idx_A, idx_B = v_idx[b], v_idx[b + 1]
-
-            vc1_4, vc2_4 = v_hash_consts[4]
-            op1_4, _, op2_4, op3_4, _ = HASH_STAGES[4]
+            # Step 3a: group0 = bit0 * diff_34 + f3
             self.add_bundle({"valu": [
-                ("&", v_bit0_C, idx_A, v_one), (">>", v_bit1_C, idx_A, v_one),
-                (op1_4, v_tmp1_A, prev_val_A, vc1_4), (op3_4, v_tmp2_A, prev_val_A, vc2_4),
+                ("multiply_add", group0_regs[i], offset_regs[i], v_diff_34, v_f3) for i in range(n)
             ]})
+            # Step 3b: group1 = bit0 * diff_56 + f5 (overwrites bit0)
             self.add_bundle({"valu": [
-                ("&", v_bit0_D, idx_B, v_one), (">>", v_bit1_D, idx_B, v_one),
-                (op2_4, prev_val_A, v_tmp1_A, v_tmp2_A),
-                (op1_4, v_tmp1_B, prev_val_B, vc1_4), (op3_4, v_tmp2_B, prev_val_B, vc2_4),
+                ("multiply_add", offset_regs[i], offset_regs[i], v_diff_56, v_f5) for i in range(n)
             ]})
-            vc1_5, vc2_5 = v_hash_consts[5]
-            op1_5, _, op2_5, op3_5, _ = HASH_STAGES[5]
+            # Step 4: diff_groups = group1 - group0
+            self.add_bundle({"valu": [("-", offset_regs[i], offset_regs[i], group0_regs[i]) for i in range(n)]})
+            # Step 5: node_val = bit1 * diff_groups + group0
             self.add_bundle({"valu": [
-                ("&", v_bit1_C, v_bit1_C, v_one), ("&", v_bit1_D, v_bit1_D, v_one),
-                (op2_4, prev_val_B, v_tmp1_B, v_tmp2_B),
-            ]})
-            self.add_bundle({
-                "flow": [("vselect", v_r_odd, v_bit1_C, v_f3, v_f5)],
-                "valu": [(op1_5, v_tmp1_A, prev_val_A, vc1_5), (op3_5, v_tmp2_A, prev_val_A, vc2_5)],
-            })
-            self.add_bundle({
-                "flow": [("vselect", v_r_even, v_bit1_C, v_f6, v_f4)],
-                "valu": [(op2_5, prev_val_A, v_tmp1_A, v_tmp2_A)],
-            })
-            self.add_bundle({
-                "flow": [("vselect", v_node_A, v_bit0_C, v_r_odd, v_r_even)],
-                "valu": [(op1_5, v_tmp1_B, prev_val_B, vc1_5), (op3_5, v_tmp2_B, prev_val_B, vc2_5)],
-            })
-            self.add_bundle({
-                "flow": [("vselect", v_r_odd, v_bit1_D, v_f3, v_f5)],
-                "valu": [(op2_5, prev_val_B, v_tmp1_B, v_tmp2_B)],
-            })
-            self.add_bundle({
-                "flow": [("vselect", v_r_even, v_bit1_D, v_f6, v_f4)],
-                "valu": [("&", v_tmp1_A, prev_val_A, v_one), ("<<", prev_idx_A, prev_idx_A, v_one)],
-            })
-            self.add_bundle({
-                "flow": [("vselect", v_node_B, v_bit0_D, v_r_odd, v_r_even)],
-                "valu": [
-                    ("+", v_tmp1_A, v_tmp1_A, v_one),
-                    ("&", v_tmp1_B, prev_val_B, v_one), ("<<", prev_idx_B, prev_idx_B, v_one),
-                ],
-            })
-            self.add_bundle({"valu": [
-                ("+", prev_idx_A, prev_idx_A, v_tmp1_A),
-                ("+", v_tmp1_B, v_tmp1_B, v_one),
-            ]})
-            self.add_bundle({"valu": [
-                ("+", prev_idx_B, prev_idx_B, v_tmp1_B),
-                ("^", val_A, val_A, v_node_A), ("^", val_B, val_B, v_node_B),
+                ("multiply_add", offset_regs[i], bit1_regs[i], offset_regs[i], group0_regs[i]) for i in range(n)
             ]})
 
-            # Hash stages 0-3 with multiply_add for stages 0, 2
-            mult_consts = [v_mult_4097, None, v_mult_33, None]
-            for hi in range(4):
+            # XOR val with node_val
+            self.add_bundle({"valu": [("^", vals[i], vals[i], offset_regs[i]) for i in range(n)]})
+
+            # Hash stages 0-5
+            for hi in range(6):
                 vc1, vc2 = v_hash_consts[hi]
                 op1, _, op2, op3, _ = HASH_STAGES[hi]
-                if hi in [0, 2]:
+                if hi in [0, 2, 4]:
                     self.add_bundle({"valu": [
-                        ("multiply_add", val_A, val_A, mult_consts[hi], vc1),
-                        ("multiply_add", val_B, val_B, mult_consts[hi], vc1),
+                        ("multiply_add", vals[i], vals[i], mult_consts[hi], vc1) for i in range(n)
                     ]})
                 else:
-                    self.add_bundle({"valu": [
-                        (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
-                        (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
-                    ]})
-                    self.add_bundle({"valu": [(op2, val_A, v_tmp1_A, v_tmp2_A), (op2, val_B, v_tmp1_B, v_tmp2_B)]})
+                    if n > 3:
+                        self.add_bundle({"valu": [
+                            op for i in range(3) for op in [
+                                (op1, tmp6[i][0], vals[i], vc1), (op3, tmp6[i][1], vals[i], vc2),
+                            ]
+                        ]})
+                        self.add_bundle({"valu": [
+                            op for i in range(3, n) for op in [
+                                (op1, tmp6[i][0], vals[i], vc1), (op3, tmp6[i][1], vals[i], vc2),
+                            ]
+                        ]})
+                    else:
+                        self.add_bundle({"valu": [
+                            op for i in range(n) for op in [
+                                (op1, tmp6[i][0], vals[i], vc1), (op3, tmp6[i][1], vals[i], vc2),
+                            ]
+                        ]})
+                    self.add_bundle({"valu": [(op2, vals[i], tmp6[i][0], tmp6[i][1]) for i in range(n)]})
 
-            prev_val_A, prev_val_B = val_A, val_B
-            prev_idx_A, prev_idx_B = idx_A, idx_B
+            # idx = 2*idx + (val&1 + 1) (3 cycles)
+            self.add_bundle({"valu": [("&", tmp6[i][0], vals[i], v_one) for i in range(n)]})
+            self.add_bundle({"valu": [("+", tmp6[i][0], tmp6[i][0], v_one) for i in range(n)]})
+            self.add_bundle({"valu": [("multiply_add", idxs[i], idxs[i], v_two, tmp6[i][0]) for i in range(n)]})
 
-        # Finish last pair
-        vc1_4, vc2_4 = v_hash_consts[4]
-        op1_4, _, op2_4, op3_4, _ = HASH_STAGES[4]
-        vc1_5, vc2_5 = v_hash_consts[5]
-        op1_5, _, op2_5, op3_5, _ = HASH_STAGES[5]
-        self.add_bundle({"valu": [
-            (op1_4, v_tmp1_A, prev_val_A, vc1_4), (op3_4, v_tmp2_A, prev_val_A, vc2_4),
-            (op1_4, v_tmp1_B, prev_val_B, vc1_4), (op3_4, v_tmp2_B, prev_val_B, vc2_4),
-        ]})
-        self.add_bundle({"valu": [(op2_4, prev_val_A, v_tmp1_A, v_tmp2_A), (op2_4, prev_val_B, v_tmp1_B, v_tmp2_B)]})
-        self.add_bundle({"valu": [
-            (op1_5, v_tmp1_A, prev_val_A, vc1_5), (op3_5, v_tmp2_A, prev_val_A, vc2_5),
-            (op1_5, v_tmp1_B, prev_val_B, vc1_5), (op3_5, v_tmp2_B, prev_val_B, vc2_5),
-        ]})
-        self.add_bundle({"valu": [(op2_5, prev_val_A, v_tmp1_A, v_tmp2_A), (op2_5, prev_val_B, v_tmp1_B, v_tmp2_B)]})
-        # OPTIMIZATION: Overlap round 13's idx finish with round 14's address computation
-        # Compute addresses for round 14's batch 0 while finishing round 13's idx
+        # Pre-load round 14 batch 0 (standalone, no overlap with idx finish)
         base_14 = 0
         batch_info_14 = [(v_idx[base_14 + i], v_val[base_14 + i]) for i in range(4)]
         nodes_14 = node_set_A
 
-        self.add_bundle({
-            "alu": [("+", addr_A[i], self.scratch["forest_values_p"], batch_info_14[0][0] + i) for i in range(VLEN)],
-            "valu": [
-                ("&", v_tmp1_A, prev_val_A, v_one), ("<<", prev_idx_A, prev_idx_A, v_one),
-                ("&", v_tmp1_B, prev_val_B, v_one), ("<<", prev_idx_B, prev_idx_B, v_one),
-            ],
-        })
-        self.add_bundle({
-            "load": [("load", nodes_14[0] + 0, addr_A[0]), ("load", nodes_14[0] + 1, addr_A[1])],
-            "valu": [("+", v_tmp1_A, v_tmp1_A, v_one), ("+", v_tmp1_B, v_tmp1_B, v_one)],
-        })
-        self.add_bundle({
-            "load": [("load", nodes_14[0] + 2, addr_A[2]), ("load", nodes_14[0] + 3, addr_A[3])],
-            "valu": [("+", prev_idx_A, prev_idx_A, v_tmp1_A), ("+", prev_idx_B, prev_idx_B, v_tmp1_B)],
-        })
-        self.add_bundle({"load": [("load", nodes_14[0] + 4, addr_A[4]), ("load", nodes_14[0] + 5, addr_A[5])]})
-        self.add_bundle({"load": [("load", nodes_14[0] + 6, addr_A[6]), ("load", nodes_14[0] + 7, addr_A[7])]})
+        self.add_bundle({"alu": [("+", addr_A[i], self.scratch["forest_values_p"], batch_info_14[0][0] + i) for i in range(VLEN)]})
+        for i in range(0, VLEN, 2):
+            self.add_bundle({"load": [("load", nodes_14[0] + i, addr_A[i]), ("load", nodes_14[0] + i + 1, addr_A[i + 1])]})
 
         # Rounds 14-15: Use cross-group pre-loading like main loop
         for _round in range(14, 16):
@@ -1837,7 +1696,7 @@ class KernelBuilder:
             })
             self.add_bundle({"load": [("load", next_nodes[3] + 6, addr_A[6]), ("load", next_nodes[3] + 7, addr_A[7])]})
 
-            # ===== GROUPS 1-6: Use pre-loaded nodes + pre-load next group =====
+            # ===== GROUPS 1-6: multiply_add hash + overlapped next-group loading =====
             for group in range(1, 7):
                 base = group * 4
                 batch_info = [(v_idx[base + i], v_val[base + i]) for i in range(4)]
@@ -1847,296 +1706,198 @@ class KernelBuilder:
                 next_base = (group + 1) * 4
                 next_batch_info = [(v_idx[next_base + i], v_val[next_base + i]) for i in range(4)]
 
-                # Compute addresses for next batches 0,1 + XOR current batches
+                # C1: addr_A(next_b0) + XOR(0-3)
                 self.add_bundle({
-                    "alu": [("+", addr_A[i], self.scratch["forest_values_p"], next_batch_info[0][0] + i) for i in range(VLEN)],
-                    "valu": [
-                        ("^", batch_info[0][1], batch_info[0][1], nodes[0]),
-                        ("^", batch_info[1][1], batch_info[1][1], nodes[1]),
-                        ("^", batch_info[2][1], batch_info[2][1], nodes[2]),
-                        ("^", batch_info[3][1], batch_info[3][1], nodes[3]),
-                    ],
+                    "alu": [("+", addr_A[i], fp, next_batch_info[0][0] + i) for i in range(VLEN)],
+                    "valu": [("^", batch_info[j][1], batch_info[j][1], nodes[j]) for j in range(4)],
                 })
+                # C2: addr_B(next_b1) + multiply_add stage 0 (0-3)
                 self.add_bundle({
-                    "alu": [("+", addr_B[i], self.scratch["forest_values_p"], next_batch_info[1][0] + i) for i in range(VLEN)],
-                    "valu": [
-                        (op1_0, tmp_list[0][0], batch_info[0][1], vc1_0), (op3_0, tmp_list[0][1], batch_info[0][1], vc2_0),
-                        (op1_0, tmp_list[1][0], batch_info[1][1], vc1_0), (op3_0, tmp_list[1][1], batch_info[1][1], vc2_0),
-                    ],
+                    "alu": [("+", addr_B[i], fp, next_batch_info[1][0] + i) for i in range(VLEN)],
+                    "valu": [("multiply_add", batch_info[j][1], batch_info[j][1], v_mult_4097, vc1_0) for j in range(4)],
                 })
-                # Load batches 0,1 interleaved
+                # C3: load(n0[0],n1[0]) + stage 1 step1 (0-2)
                 self.add_bundle({
                     "load": [("load", next_nodes[0] + 0, addr_A[0]), ("load", next_nodes[1] + 0, addr_B[0])],
                     "valu": [
-                        (op2_0, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
-                        (op2_0, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
-                        (op1_0, tmp_list[2][0], batch_info[2][1], vc1_0), (op3_0, tmp_list[2][1], batch_info[2][1], vc2_0),
-                    ],
-                })
-                self.add_bundle({
-                    "load": [("load", next_nodes[0] + 1, addr_A[1]), ("load", next_nodes[1] + 1, addr_B[1])],
-                    "valu": [
                         (op1_1, tmp_list[0][0], batch_info[0][1], vc1_1), (op3_1, tmp_list[0][1], batch_info[0][1], vc2_1),
                         (op1_1, tmp_list[1][0], batch_info[1][1], vc1_1), (op3_1, tmp_list[1][1], batch_info[1][1], vc2_1),
-                    ],
-                })
-                self.add_bundle({
-                    "load": [("load", next_nodes[0] + 2, addr_A[2]), ("load", next_nodes[1] + 2, addr_B[2])],
-                    "valu": [
-                        (op2_1, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
-                        (op2_1, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
-                        (op2_0, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
-                        (op1_0, tmp_list[3][0], batch_info[3][1], vc1_0), (op3_0, tmp_list[3][1], batch_info[3][1], vc2_0),
-                    ],
-                })
-                self.add_bundle({
-                    "load": [("load", next_nodes[0] + 3, addr_A[3]), ("load", next_nodes[1] + 3, addr_B[3])],
-                    "valu": [
-                        (op1_2, tmp_list[0][0], batch_info[0][1], vc1_2), (op3_2, tmp_list[0][1], batch_info[0][1], vc2_2),
-                        (op1_2, tmp_list[1][0], batch_info[1][1], vc1_2), (op3_2, tmp_list[1][1], batch_info[1][1], vc2_2),
-                    ],
-                })
-                self.add_bundle({
-                    "load": [("load", next_nodes[0] + 4, addr_A[4]), ("load", next_nodes[1] + 4, addr_B[4])],
-                    "valu": [
-                        (op2_2, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
-                        (op2_2, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
                         (op1_1, tmp_list[2][0], batch_info[2][1], vc1_1), (op3_1, tmp_list[2][1], batch_info[2][1], vc2_1),
                     ],
                 })
+                # C4: load(n0[1],n1[1]) + stage 1 step1 (3)
                 self.add_bundle({
-                    "load": [("load", next_nodes[0] + 5, addr_A[5]), ("load", next_nodes[1] + 5, addr_B[5])],
+                    "load": [("load", next_nodes[0] + 1, addr_A[1]), ("load", next_nodes[1] + 1, addr_B[1])],
                     "valu": [
-                        (op1_3, tmp_list[0][0], batch_info[0][1], vc1_3), (op3_3, tmp_list[0][1], batch_info[0][1], vc2_3),
-                        (op1_3, tmp_list[1][0], batch_info[1][1], vc1_3), (op3_3, tmp_list[1][1], batch_info[1][1], vc2_3),
-                    ],
-                })
-                self.add_bundle({
-                    "load": [("load", next_nodes[0] + 6, addr_A[6]), ("load", next_nodes[1] + 6, addr_B[6])],
-                    "valu": [
-                        (op2_3, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
-                        (op2_3, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
-                        (op2_1, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
-                        (op2_0, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
-                    ],
-                })
-                self.add_bundle({
-                    "load": [("load", next_nodes[0] + 7, addr_A[7]), ("load", next_nodes[1] + 7, addr_B[7])],
-                    "valu": [
-                        (op1_4, tmp_list[0][0], batch_info[0][1], vc1_4), (op3_4, tmp_list[0][1], batch_info[0][1], vc2_4),
-                        (op1_4, tmp_list[1][0], batch_info[1][1], vc1_4), (op3_4, tmp_list[1][1], batch_info[1][1], vc2_4),
-                    ],
-                })
-                # Compute addresses for next batches 2,3
-                self.add_bundle({
-                    "alu": [("+", addr_A[i], self.scratch["forest_values_p"], next_batch_info[2][0] + i) for i in range(VLEN)],
-                    "valu": [
-                        (op2_4, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
-                        (op2_4, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
-                        (op1_2, tmp_list[2][0], batch_info[2][1], vc1_2), (op3_2, tmp_list[2][1], batch_info[2][1], vc2_2),
-                    ],
-                })
-                self.add_bundle({
-                    "alu": [("+", addr_B[i], self.scratch["forest_values_p"], next_batch_info[3][0] + i) for i in range(VLEN)],
-                    "valu": [
-                        (op1_5, tmp_list[0][0], batch_info[0][1], vc1_5), (op3_5, tmp_list[0][1], batch_info[0][1], vc2_5),
-                        (op1_5, tmp_list[1][0], batch_info[1][1], vc1_5), (op3_5, tmp_list[1][1], batch_info[1][1], vc2_5),
-                    ],
-                })
-                # Load batches 2,3 interleaved
-                self.add_bundle({
-                    "load": [("load", next_nodes[2] + 0, addr_A[0]), ("load", next_nodes[3] + 0, addr_B[0])],
-                    "valu": [
-                        (op2_5, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
-                        (op2_5, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
-                        (op2_2, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
                         (op1_1, tmp_list[3][0], batch_info[3][1], vc1_1), (op3_1, tmp_list[3][1], batch_info[3][1], vc2_1),
                     ],
                 })
+                # C5: load(n0[2],n1[2]) + stage 1 step2 (0-3)
+                self.add_bundle({
+                    "load": [("load", next_nodes[0] + 2, addr_A[2]), ("load", next_nodes[1] + 2, addr_B[2])],
+                    "valu": [(op2_1, batch_info[j][1], tmp_list[j][0], tmp_list[j][1]) for j in range(4)],
+                })
+                # C6: load(n0[3],n1[3]) + multiply_add stage 2 (0-3)
+                self.add_bundle({
+                    "load": [("load", next_nodes[0] + 3, addr_A[3]), ("load", next_nodes[1] + 3, addr_B[3])],
+                    "valu": [("multiply_add", batch_info[j][1], batch_info[j][1], v_mult_33, vc1_2) for j in range(4)],
+                })
+                # C7: load(n0[4],n1[4]) + stage 3 step1 (0-2)
+                self.add_bundle({
+                    "load": [("load", next_nodes[0] + 4, addr_A[4]), ("load", next_nodes[1] + 4, addr_B[4])],
+                    "valu": [
+                        (op1_3, tmp_list[0][0], batch_info[0][1], vc1_3), (op3_3, tmp_list[0][1], batch_info[0][1], vc2_3),
+                        (op1_3, tmp_list[1][0], batch_info[1][1], vc1_3), (op3_3, tmp_list[1][1], batch_info[1][1], vc2_3),
+                        (op1_3, tmp_list[2][0], batch_info[2][1], vc1_3), (op3_3, tmp_list[2][1], batch_info[2][1], vc2_3),
+                    ],
+                })
+                # C8: load(n0[5],n1[5]) + stage 3 step1 (3)
+                self.add_bundle({
+                    "load": [("load", next_nodes[0] + 5, addr_A[5]), ("load", next_nodes[1] + 5, addr_B[5])],
+                    "valu": [
+                        (op1_3, tmp_list[3][0], batch_info[3][1], vc1_3), (op3_3, tmp_list[3][1], batch_info[3][1], vc2_3),
+                    ],
+                })
+                # C9: load(n0[6],n1[6]) + stage 3 step2 (0-3)
+                self.add_bundle({
+                    "load": [("load", next_nodes[0] + 6, addr_A[6]), ("load", next_nodes[1] + 6, addr_B[6])],
+                    "valu": [(op2_3, batch_info[j][1], tmp_list[j][0], tmp_list[j][1]) for j in range(4)],
+                })
+                # C10: load(n0[7],n1[7]) + multiply_add stage 4 (0-3)
+                self.add_bundle({
+                    "load": [("load", next_nodes[0] + 7, addr_A[7]), ("load", next_nodes[1] + 7, addr_B[7])],
+                    "valu": [("multiply_add", batch_info[j][1], batch_info[j][1], v_mult_9, vc1_4) for j in range(4)],
+                })
+                # C11: addr_A(next_b2) + stage 5 step1 (0-2)
+                self.add_bundle({
+                    "alu": [("+", addr_A[i], fp, next_batch_info[2][0] + i) for i in range(VLEN)],
+                    "valu": [
+                        (op1_5, tmp_list[0][0], batch_info[0][1], vc1_5), (op3_5, tmp_list[0][1], batch_info[0][1], vc2_5),
+                        (op1_5, tmp_list[1][0], batch_info[1][1], vc1_5), (op3_5, tmp_list[1][1], batch_info[1][1], vc2_5),
+                        (op1_5, tmp_list[2][0], batch_info[2][1], vc1_5), (op3_5, tmp_list[2][1], batch_info[2][1], vc2_5),
+                    ],
+                })
+                # C12: addr_B(next_b3) + stage 5 step1 (3)
+                self.add_bundle({
+                    "alu": [("+", addr_B[i], fp, next_batch_info[3][0] + i) for i in range(VLEN)],
+                    "valu": [
+                        (op1_5, tmp_list[3][0], batch_info[3][1], vc1_5), (op3_5, tmp_list[3][1], batch_info[3][1], vc2_5),
+                    ],
+                })
+                # C13: load(n2[0],n3[0]) + stage 5 step2 (0-3)
+                self.add_bundle({
+                    "load": [("load", next_nodes[2] + 0, addr_A[0]), ("load", next_nodes[3] + 0, addr_B[0])],
+                    "valu": [(op2_5, batch_info[j][1], tmp_list[j][0], tmp_list[j][1]) for j in range(4)],
+                })
+                # C14: load(n2[1],n3[1]) + idx &+<< (0-2)
                 self.add_bundle({
                     "load": [("load", next_nodes[2] + 1, addr_A[1]), ("load", next_nodes[3] + 1, addr_B[1])],
                     "valu": [
                         ("&", tmp_list[0][0], batch_info[0][1], v_one), ("<<", batch_info[0][0], batch_info[0][0], v_one),
                         ("&", tmp_list[1][0], batch_info[1][1], v_one), ("<<", batch_info[1][0], batch_info[1][0], v_one),
+                        ("&", tmp_list[2][0], batch_info[2][1], v_one), ("<<", batch_info[2][0], batch_info[2][0], v_one),
                     ],
                 })
+                # C15: load(n2[2],n3[2]) + idx &+<<(3) + +(bit)(0-2)
                 self.add_bundle({
                     "load": [("load", next_nodes[2] + 2, addr_A[2]), ("load", next_nodes[3] + 2, addr_B[2])],
                     "valu": [
+                        ("&", tmp_list[3][0], batch_info[3][1], v_one), ("<<", batch_info[3][0], batch_info[3][0], v_one),
                         ("+", tmp_list[0][0], tmp_list[0][0], v_one),
                         ("+", tmp_list[1][0], tmp_list[1][0], v_one),
-                        (op1_3, tmp_list[2][0], batch_info[2][1], vc1_3), (op3_3, tmp_list[2][1], batch_info[2][1], vc2_3),
+                        ("+", tmp_list[2][0], tmp_list[2][0], v_one),
                     ],
                 })
+                # C16: load(n2[3],n3[3]) + +(bit)(3) + +(idx)(0-2)
                 self.add_bundle({
                     "load": [("load", next_nodes[2] + 3, addr_A[3]), ("load", next_nodes[3] + 3, addr_B[3])],
                     "valu": [
+                        ("+", tmp_list[3][0], tmp_list[3][0], v_one),
                         ("+", batch_info[0][0], batch_info[0][0], tmp_list[0][0]),
                         ("+", batch_info[1][0], batch_info[1][0], tmp_list[1][0]),
-                        (op2_3, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
-                        (op2_1, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
+                        ("+", batch_info[2][0], batch_info[2][0], tmp_list[2][0]),
                     ],
                 })
+                # C17: load(n2[4],n3[4]) + +(idx)(3)
                 self.add_bundle({
                     "load": [("load", next_nodes[2] + 4, addr_A[4]), ("load", next_nodes[3] + 4, addr_B[4])],
-                    "valu": [
-                        (op1_4, tmp_list[2][0], batch_info[2][1], vc1_4), (op3_4, tmp_list[2][1], batch_info[2][1], vc2_4),
-                        (op1_2, tmp_list[3][0], batch_info[3][1], vc1_2), (op3_2, tmp_list[3][1], batch_info[3][1], vc2_2),
-                    ],
+                    "valu": [("+", batch_info[3][0], batch_info[3][0], tmp_list[3][0])],
                 })
-                self.add_bundle({
-                    "load": [("load", next_nodes[2] + 5, addr_A[5]), ("load", next_nodes[3] + 5, addr_B[5])],
-                    "valu": [
-                        (op2_4, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
-                        (op2_2, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
-                    ],
-                })
-                self.add_bundle({
-                    "load": [("load", next_nodes[2] + 6, addr_A[6]), ("load", next_nodes[3] + 6, addr_B[6])],
-                    "valu": [
-                        (op1_5, tmp_list[2][0], batch_info[2][1], vc1_5), (op3_5, tmp_list[2][1], batch_info[2][1], vc2_5),
-                        (op1_3, tmp_list[3][0], batch_info[3][1], vc1_3), (op3_3, tmp_list[3][1], batch_info[3][1], vc2_3),
-                    ],
-                })
-                self.add_bundle({
-                    "load": [("load", next_nodes[2] + 7, addr_A[7]), ("load", next_nodes[3] + 7, addr_B[7])],
-                    "valu": [
-                        (op2_5, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
-                        (op2_3, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
-                    ],
-                })
-                # Finish idx for batches 2,3
-                self.add_bundle({"valu": [
-                    ("&", tmp_list[2][0], batch_info[2][1], v_one), ("<<", batch_info[2][0], batch_info[2][0], v_one),
-                    (op1_4, tmp_list[3][0], batch_info[3][1], vc1_4), (op3_4, tmp_list[3][1], batch_info[3][1], vc2_4),
-                ]})
-                self.add_bundle({"valu": [
-                    ("+", tmp_list[2][0], tmp_list[2][0], v_one),
-                    (op2_4, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
-                ]})
-                self.add_bundle({"valu": [
-                    ("+", batch_info[2][0], batch_info[2][0], tmp_list[2][0]),
-                    (op1_5, tmp_list[3][0], batch_info[3][1], vc1_5), (op3_5, tmp_list[3][1], batch_info[3][1], vc2_5),
-                ]})
-                self.add_bundle({"valu": [(op2_5, batch_info[3][1], tmp_list[3][0], tmp_list[3][1])]})
-                self.add_bundle({"valu": [("&", tmp_list[3][0], batch_info[3][1], v_one), ("<<", batch_info[3][0], batch_info[3][0], v_one)]})
-                self.add_bundle({"valu": [("+", tmp_list[3][0], tmp_list[3][0], v_one)]})
-                self.add_bundle({"valu": [("+", batch_info[3][0], batch_info[3][0], tmp_list[3][0])]})
+                # C18-20: remaining loads
+                self.add_bundle({"load": [("load", next_nodes[2] + 5, addr_A[5]), ("load", next_nodes[3] + 5, addr_B[5])]})
+                self.add_bundle({"load": [("load", next_nodes[2] + 6, addr_A[6]), ("load", next_nodes[3] + 6, addr_B[6])]})
+                self.add_bundle({"load": [("load", next_nodes[2] + 7, addr_A[7]), ("load", next_nodes[3] + 7, addr_B[7])]})
 
-            # ===== GROUP 7: Use pre-loaded nodes, no next group to load =====
+            # ===== GROUP 7: multiply_add hash, no next group to load =====
             base = 7 * 4
             batch_info = [(v_idx[base + i], v_val[base + i]) for i in range(4)]
             nodes = node_set_B
 
-            self.add_bundle({"valu": [
-                ("^", batch_info[0][1], batch_info[0][1], nodes[0]),
-                ("^", batch_info[1][1], batch_info[1][1], nodes[1]),
-                ("^", batch_info[2][1], batch_info[2][1], nodes[2]),
-                ("^", batch_info[3][1], batch_info[3][1], nodes[3]),
-            ]})
-            self.add_bundle({"valu": [
-                (op1_0, tmp_list[0][0], batch_info[0][1], vc1_0), (op3_0, tmp_list[0][1], batch_info[0][1], vc2_0),
-                (op1_0, tmp_list[1][0], batch_info[1][1], vc1_0), (op3_0, tmp_list[1][1], batch_info[1][1], vc2_0),
-            ]})
-            self.add_bundle({"valu": [
-                (op2_0, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
-                (op2_0, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
-                (op1_0, tmp_list[2][0], batch_info[2][1], vc1_0), (op3_0, tmp_list[2][1], batch_info[2][1], vc2_0),
-            ]})
+            # C1: XOR(0-3)
+            self.add_bundle({"valu": [("^", batch_info[j][1], batch_info[j][1], nodes[j]) for j in range(4)]})
+            # C2: multiply_add stage 0(0-3)
+            self.add_bundle({"valu": [("multiply_add", batch_info[j][1], batch_info[j][1], v_mult_4097, vc1_0) for j in range(4)]})
+            # C3: stage 1 step1(0-2)
             self.add_bundle({"valu": [
                 (op1_1, tmp_list[0][0], batch_info[0][1], vc1_1), (op3_1, tmp_list[0][1], batch_info[0][1], vc2_1),
                 (op1_1, tmp_list[1][0], batch_info[1][1], vc1_1), (op3_1, tmp_list[1][1], batch_info[1][1], vc2_1),
-            ]})
-            self.add_bundle({"valu": [
-                (op2_1, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
-                (op2_1, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
-                (op2_0, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
-                (op1_0, tmp_list[3][0], batch_info[3][1], vc1_0), (op3_0, tmp_list[3][1], batch_info[3][1], vc2_0),
-            ]})
-            self.add_bundle({"valu": [
-                (op1_2, tmp_list[0][0], batch_info[0][1], vc1_2), (op3_2, tmp_list[0][1], batch_info[0][1], vc2_2),
-                (op1_2, tmp_list[1][0], batch_info[1][1], vc1_2), (op3_2, tmp_list[1][1], batch_info[1][1], vc2_2),
-            ]})
-            self.add_bundle({"valu": [
-                (op2_2, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
-                (op2_2, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
                 (op1_1, tmp_list[2][0], batch_info[2][1], vc1_1), (op3_1, tmp_list[2][1], batch_info[2][1], vc2_1),
             ]})
+            # C4: stage 1 step1(3)
+            self.add_bundle({"valu": [
+                (op1_1, tmp_list[3][0], batch_info[3][1], vc1_1), (op3_1, tmp_list[3][1], batch_info[3][1], vc2_1),
+            ]})
+            # C5: stage 1 step2(0-3)
+            self.add_bundle({"valu": [(op2_1, batch_info[j][1], tmp_list[j][0], tmp_list[j][1]) for j in range(4)]})
+            # C6: multiply_add stage 2(0-3)
+            self.add_bundle({"valu": [("multiply_add", batch_info[j][1], batch_info[j][1], v_mult_33, vc1_2) for j in range(4)]})
+            # C7: stage 3 step1(0-2)
             self.add_bundle({"valu": [
                 (op1_3, tmp_list[0][0], batch_info[0][1], vc1_3), (op3_3, tmp_list[0][1], batch_info[0][1], vc2_3),
                 (op1_3, tmp_list[1][0], batch_info[1][1], vc1_3), (op3_3, tmp_list[1][1], batch_info[1][1], vc2_3),
+                (op1_3, tmp_list[2][0], batch_info[2][1], vc1_3), (op3_3, tmp_list[2][1], batch_info[2][1], vc2_3),
             ]})
+            # C8: stage 3 step1(3)
             self.add_bundle({"valu": [
-                (op2_3, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
-                (op2_3, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
-                (op2_1, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
-                (op2_0, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
+                (op1_3, tmp_list[3][0], batch_info[3][1], vc1_3), (op3_3, tmp_list[3][1], batch_info[3][1], vc2_3),
             ]})
-            self.add_bundle({"valu": [
-                (op1_4, tmp_list[0][0], batch_info[0][1], vc1_4), (op3_4, tmp_list[0][1], batch_info[0][1], vc2_4),
-                (op1_4, tmp_list[1][0], batch_info[1][1], vc1_4), (op3_4, tmp_list[1][1], batch_info[1][1], vc2_4),
-            ]})
-            self.add_bundle({"valu": [
-                (op2_4, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
-                (op2_4, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
-                (op1_2, tmp_list[2][0], batch_info[2][1], vc1_2), (op3_2, tmp_list[2][1], batch_info[2][1], vc2_2),
-            ]})
+            # C9: stage 3 step2(0-3)
+            self.add_bundle({"valu": [(op2_3, batch_info[j][1], tmp_list[j][0], tmp_list[j][1]) for j in range(4)]})
+            # C10: multiply_add stage 4(0-3)
+            self.add_bundle({"valu": [("multiply_add", batch_info[j][1], batch_info[j][1], v_mult_9, vc1_4) for j in range(4)]})
+            # C11: stage 5 step1(0-2)
             self.add_bundle({"valu": [
                 (op1_5, tmp_list[0][0], batch_info[0][1], vc1_5), (op3_5, tmp_list[0][1], batch_info[0][1], vc2_5),
                 (op1_5, tmp_list[1][0], batch_info[1][1], vc1_5), (op3_5, tmp_list[1][1], batch_info[1][1], vc2_5),
+                (op1_5, tmp_list[2][0], batch_info[2][1], vc1_5), (op3_5, tmp_list[2][1], batch_info[2][1], vc2_5),
             ]})
+            # C12: stage 5 step1(3)
             self.add_bundle({"valu": [
-                (op2_5, batch_info[0][1], tmp_list[0][0], tmp_list[0][1]),
-                (op2_5, batch_info[1][1], tmp_list[1][0], tmp_list[1][1]),
-                (op2_2, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
-                (op1_1, tmp_list[3][0], batch_info[3][1], vc1_1), (op3_1, tmp_list[3][1], batch_info[3][1], vc2_1),
+                (op1_5, tmp_list[3][0], batch_info[3][1], vc1_5), (op3_5, tmp_list[3][1], batch_info[3][1], vc2_5),
             ]})
+            # C13: stage 5 step2(0-3)
+            self.add_bundle({"valu": [(op2_5, batch_info[j][1], tmp_list[j][0], tmp_list[j][1]) for j in range(4)]})
+            # C14: idx &+<<(0-2)
             self.add_bundle({"valu": [
                 ("&", tmp_list[0][0], batch_info[0][1], v_one), ("<<", batch_info[0][0], batch_info[0][0], v_one),
                 ("&", tmp_list[1][0], batch_info[1][1], v_one), ("<<", batch_info[1][0], batch_info[1][0], v_one),
+                ("&", tmp_list[2][0], batch_info[2][1], v_one), ("<<", batch_info[2][0], batch_info[2][0], v_one),
             ]})
+            # C15: idx &+<<(3) + +(bit)(0-2)
             self.add_bundle({"valu": [
+                ("&", tmp_list[3][0], batch_info[3][1], v_one), ("<<", batch_info[3][0], batch_info[3][0], v_one),
                 ("+", tmp_list[0][0], tmp_list[0][0], v_one),
                 ("+", tmp_list[1][0], tmp_list[1][0], v_one),
-                (op1_3, tmp_list[2][0], batch_info[2][1], vc1_3), (op3_3, tmp_list[2][1], batch_info[2][1], vc2_3),
+                ("+", tmp_list[2][0], tmp_list[2][0], v_one),
             ]})
+            # C16: +(bit)(3) + +(idx)(0-2)
             self.add_bundle({"valu": [
+                ("+", tmp_list[3][0], tmp_list[3][0], v_one),
                 ("+", batch_info[0][0], batch_info[0][0], tmp_list[0][0]),
                 ("+", batch_info[1][0], batch_info[1][0], tmp_list[1][0]),
-                (op2_3, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
-                (op2_1, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
-            ]})
-            self.add_bundle({"valu": [
-                (op1_4, tmp_list[2][0], batch_info[2][1], vc1_4), (op3_4, tmp_list[2][1], batch_info[2][1], vc2_4),
-                (op1_2, tmp_list[3][0], batch_info[3][1], vc1_2), (op3_2, tmp_list[3][1], batch_info[3][1], vc2_2),
-            ]})
-            self.add_bundle({"valu": [
-                (op2_4, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
-                (op2_2, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
-            ]})
-            self.add_bundle({"valu": [
-                (op1_5, tmp_list[2][0], batch_info[2][1], vc1_5), (op3_5, tmp_list[2][1], batch_info[2][1], vc2_5),
-                (op1_3, tmp_list[3][0], batch_info[3][1], vc1_3), (op3_3, tmp_list[3][1], batch_info[3][1], vc2_3),
-            ]})
-            self.add_bundle({"valu": [
-                (op2_5, batch_info[2][1], tmp_list[2][0], tmp_list[2][1]),
-                (op2_3, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
-            ]})
-            self.add_bundle({"valu": [
-                ("&", tmp_list[2][0], batch_info[2][1], v_one), ("<<", batch_info[2][0], batch_info[2][0], v_one),
-                (op1_4, tmp_list[3][0], batch_info[3][1], vc1_4), (op3_4, tmp_list[3][1], batch_info[3][1], vc2_4),
-            ]})
-            self.add_bundle({"valu": [
-                ("+", tmp_list[2][0], tmp_list[2][0], v_one),
-                (op2_4, batch_info[3][1], tmp_list[3][0], tmp_list[3][1]),
-            ]})
-            self.add_bundle({"valu": [
                 ("+", batch_info[2][0], batch_info[2][0], tmp_list[2][0]),
-                (op1_5, tmp_list[3][0], batch_info[3][1], vc1_5), (op3_5, tmp_list[3][1], batch_info[3][1], vc2_5),
             ]})
-            self.add_bundle({"valu": [(op2_5, batch_info[3][1], tmp_list[3][0], tmp_list[3][1])]})
-            self.add_bundle({"valu": [("&", tmp_list[3][0], batch_info[3][1], v_one), ("<<", batch_info[3][0], batch_info[3][0], v_one)]})
-            self.add_bundle({"valu": [("+", tmp_list[3][0], tmp_list[3][0], v_one)]})
+            # C17: +(idx)(3)
             self.add_bundle({"valu": [("+", batch_info[3][0], batch_info[3][0], tmp_list[3][0])]})
 
         # Store all indices and values back - use 2 pointers and ALU for parallel increment

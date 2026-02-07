@@ -105,3 +105,11 @@ python perf_takehome.py Tests.test_kernel_cycles
 ## Session History
 - Session 1: Baseline optimizations, reached ~4300 cycles
 - Session 2: multiply_add, forest reuse, round overlap → 3845 cycles
+- Session 3: Loop unrolling implementation + analysis → 3817 cycles
+  - Implemented full loop unrolling (rounds 3-9) in perf_takehome_optimized.py
+  - Applied multiply_add for idx computations throughout
+  - **Finding**: Loop unrolling alone saves only ~28 cycles (0.7%)
+  - **Finding**: multiply_add optimization saves 0 cycles (already well-packed)
+  - **Key insight**: Real bottleneck is lack of cross-round pipelining and bundle packing
+  - **Path forward**: Need aggressive cross-round pipelining (est. 500-800 cycle savings)
+  - Created OPTIMIZATION_SUMMARY.md with comprehensive optimization roadmap
